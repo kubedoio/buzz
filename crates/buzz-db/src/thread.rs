@@ -856,6 +856,40 @@ pub async fn get_thread_metadata_by_event(
     }))
 }
 
+/// Batch-fetch the thread root for many event ids (`event_id → root_event_id`).
+///
+/// Uses `idx_thread_metadata_event_id (community_id, event_id)`. Events with
+/// no `thread_metadata` row, or whose row has no root (depth 0), are absent
+/// from the map — callers default to `None`.
+pub async fn get_thread_roots(
+    pool: &PgPool,
+    community_id: CommunityId,
+    event_ids: &[Vec<u8>],
+) -> Result<std::collections::HashMap<Vec<u8>, Vec<u8>>> {
+    if event_ids.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+    let rows = sqlx::query(
+        r#"
+        SELECT event_id, root_event_id
+        FROM thread_metadata
+        WHERE community_id = $1 AND event_id = ANY($2) AND root_event_id IS NOT NULL
+        "#,
+    )
+    .bind(community_id.as_uuid())
+    .bind(event_ids)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|row| {
+            let event_id: Vec<u8> = row.try_get("event_id")?;
+            let root_event_id: Vec<u8> = row.try_get("root_event_id")?;
+            Ok((event_id, root_event_id))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

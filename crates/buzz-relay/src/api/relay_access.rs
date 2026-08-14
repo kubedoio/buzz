@@ -27,6 +27,8 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::Json,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
 
@@ -49,8 +51,15 @@ const ACCESS_CHECK_BATCH_PATH: &str = "/api/v1/relay/access/check-batch";
 /// The channel-registry endpoint path — the NIP-98 `u` tag must match the
 /// exact request URL including the query string.
 const RELAY_CHANNELS_PATH: &str = "/api/v1/relay/channels";
+/// The state-events endpoint path — the NIP-98 `u` tag must match the exact
+/// request URL including the query string.
+const RELAY_STATE_EVENTS_PATH: &str = "/api/v1/relay/state/events";
 /// Maximum number of checks per batch request (contract: at most 64).
 const MAX_BATCH_CHECKS: usize = 64;
+/// Page-size clamp for the state-events endpoint (contract: 1..=500).
+const STATE_EVENTS_MAX_LIMIT: i64 = 500;
+/// Default page size for the state-events endpoint when `limit` is absent.
+const STATE_EVENTS_DEFAULT_LIMIT: i64 = 500;
 
 /// A single access-check request body.
 ///
@@ -578,6 +587,231 @@ pub async fn list_channels(
     sign_response(&state, content)
 }
 
+/// Query for `GET /api/v1/relay/state/events`.
+#[derive(serde::Deserialize)]
+pub struct StateEventsQuery {
+    /// Only events whose own `created_at` is at or after this unix timestamp.
+    since: Option<i64>,
+    /// Maximum page size, clamped to 1..=[`STATE_EVENTS_MAX_LIMIT`].
+    limit: Option<i64>,
+    /// Opaque continuation token from a previous page (base64 of
+    /// `<created_at_unix>:<event_id_hex>`).
+    cursor: Option<String>,
+}
+
+/// A parsed state-events keyset cursor position.
+struct StateCursor {
+    /// The `created_at` of the previous page's last row.
+    created_at: DateTime<Utc>,
+    /// The event id of the previous page's last row.
+    id: Vec<u8>,
+}
+
+/// Encode the opaque state-events cursor for the last row of a page.
+///
+/// Format: base64 of `"<created_at_unix>:<event_id_hex>"` — documented here
+/// as the wire contract for the endpoint.
+fn encode_state_cursor(created_at: DateTime<Utc>, id: &[u8]) -> String {
+    let text = format!("{}:{}", created_at.timestamp(), hex::encode(id));
+    BASE64.encode(text)
+}
+
+/// Parse an opaque state-events cursor back into its keyset position.
+///
+/// Malformed cursors (bad base64, missing separator, non-numeric timestamp,
+/// non-hex id) fail closed with 400 — never silently restart the paging.
+fn parse_state_cursor(raw: &str) -> Result<StateCursor, (StatusCode, Json<Value>)> {
+    let decoded = BASE64
+        .decode(raw)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid cursor"))?;
+    let text = String::from_utf8(decoded)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid cursor"))?;
+    let (ts_part, id_part) = text
+        .split_once(':')
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "invalid cursor"))?;
+    let ts: i64 = ts_part
+        .parse()
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid cursor"))?;
+    let created_at = DateTime::from_timestamp(ts, 0)
+        .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "invalid cursor"))?;
+    let id =
+        hex::decode(id_part).map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid cursor"))?;
+    Ok(StateCursor { created_at, id })
+}
+
+/// Map a Buzz channel to the Elembra channel-kind vocabulary.
+///
+/// `dm` channels → `"dm"`; anything else that is private → `"private"`;
+/// everything else → `"workspace"`. `"excluded"` is an Elembra-side concept
+/// and is never emitted.
+fn map_channel_kind(channel_type: &str, visibility: &str) -> &'static str {
+    if channel_type == "dm" {
+        "dm"
+    } else if visibility == "private" {
+        "private"
+    } else {
+        "workspace"
+    }
+}
+
+/// Page the community's signed kind-1 event state for reconciliation.
+///
+/// NIP-98 GET: the `u` tag covers the exact request URL INCLUDING the query
+/// string (GET carries no `payload` tag), so `since`/`limit`/`cursor` are
+/// bound by the signature. Returns one kind-19030 event signed by the relay
+/// key whose `content` is `{ "entries": [...], "cursor": <opaque>|null,
+/// "complete": bool }`.
+///
+/// Each entry carries the raw signed kind-1 event JSON plus a `context`
+/// field-for-field identical to Elembra's `BuzzPushContext`:
+/// `{ community_id, channel_id, channel_kind, thread_root_id|null,
+/// message_id, event_type, supersedes_event_id|null }`. `channel_kind` is
+/// mapped from the relay's own channel state (dm → `"dm"`, private →
+/// `"private"`, else → `"workspace"`; `"excluded"` is never emitted);
+/// `event_type` is `"deleted"` for soft-deleted (tombstoned) events and
+/// `"created"` otherwise (`"edited"` is never emitted — kind-1 events are
+/// immutable); `supersedes_event_id` is always null in v1alpha1.
+///
+/// Paging is keyset-ordered by `(created_at ASC, event_id ASC)` over the
+/// event's own `created_at`; `since` filters inclusively on it and `limit`
+/// is clamped to 1..=500 (out-of-range values clamp, never error). The
+/// cursor is opaque base64 of `<created_at_unix>:<event_id_hex>`; the final
+/// page reports `complete: true, cursor: null` (never `cursor: null` with
+/// `complete: false`). Only the Host-derived community's channel-scoped
+/// kind-1 events are paged; events of soft-deleted channels are excluded.
+/// Untrusted callers get 401 (same trusted-service gate as the other
+/// endpoints).
+pub async fn page_state(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(query): Query<StateEventsQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Row zero: the community is derived from the request Host, never from
+    // client-supplied ids.
+    let raw_host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let tenant = crate::tenant::bind_community(&state.db, raw_host)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "relay: no community is configured for this host",
+            )
+        })?;
+
+    // NIP-98 (kind-27235), pinned mandatory — no dev-mode X-Pubkey fallback.
+    // The `u` tag covers path + raw query string, so the paging parameters
+    // cannot be swapped after the fact.
+    let path_with_query = match raw_query {
+        Some(q) if !q.is_empty() => format!("{RELAY_STATE_EVENTS_PATH}?{q}"),
+        _ => RELAY_STATE_EVENTS_PATH.to_string(),
+    };
+    let url = nip98_expected_url(&state.config.relay_url, &tenant, &path_with_query);
+    let (caller_pubkey, event_id_bytes) = verify_bridge_auth(&headers, "GET", &url, None, true)?;
+
+    // Trusted-service gate: only provisioned service pubkeys may call the
+    // authorization API. An empty allowlist disables it entirely (fail closed).
+    let caller_hex = caller_pubkey.to_hex();
+    if !state
+        .config
+        .relay_trusted_service_pubkeys
+        .iter()
+        .any(|trusted| trusted == &caller_hex)
+    {
+        return Err(api_error(StatusCode::UNAUTHORIZED, "untrusted caller"));
+    }
+
+    // Admission (rate limit) and NIP-98 replay protection.
+    enforce_http_admission(&state, &tenant, &caller_pubkey).await?;
+    check_nip98_replay(&state, &tenant, event_id_bytes).await?;
+
+    let since: Option<DateTime<Utc>> = match query.since {
+        Some(ts) => Some(
+            DateTime::from_timestamp(ts, 0)
+                .ok_or_else(|| api_error(StatusCode::BAD_REQUEST, "invalid since"))?,
+        ),
+        None => None,
+    };
+    let after = match query.cursor.as_deref() {
+        Some(raw) => {
+            let cursor = parse_state_cursor(raw)?;
+            Some((cursor.created_at, cursor.id))
+        }
+        None => None,
+    };
+    let limit = query
+        .limit
+        .unwrap_or(STATE_EVENTS_DEFAULT_LIMIT)
+        .clamp(1, STATE_EVENTS_MAX_LIMIT) as usize;
+
+    let page = state
+        .db
+        .query_state_events(tenant.community(), since, after, limit)
+        .await
+        .map_err(|e| internal_error(&format!("state events page failed: {e}")))?;
+
+    // One batch query for the thread roots of every event on the page.
+    let event_ids: Vec<Vec<u8>> = page
+        .rows
+        .iter()
+        .map(|row| row.stored_event.event.id.to_bytes().to_vec())
+        .collect();
+    let thread_roots = state
+        .db
+        .get_thread_roots(tenant.community(), &event_ids)
+        .await
+        .map_err(|e| internal_error(&format!("thread root lookup failed: {e}")))?;
+
+    let community_id = tenant.community().to_string();
+    let entries: Vec<Value> = page
+        .rows
+        .iter()
+        .map(|row| {
+            let event = &row.stored_event.event;
+            let event_id = event.id.to_bytes().to_vec();
+            let thread_root_id = thread_roots.get(&event_id).map(hex::encode);
+            serde_json::json!({
+                "event": event,
+                "context": {
+                    "community_id": community_id,
+                    "channel_id": row.channel_id.to_string(),
+                    "channel_kind": map_channel_kind(&row.channel_type, &row.visibility),
+                    "thread_root_id": thread_root_id,
+                    "message_id": event.id.to_hex(),
+                    "event_type": if row.is_deleted { "deleted" } else { "created" },
+                    "supersedes_event_id": None::<String>,
+                },
+            })
+        })
+        .collect();
+
+    // Final page: `complete: true, cursor: null`; otherwise the cursor of the
+    // last returned row (never `cursor: null` with `complete: false`).
+    let cursor = match page.rows.last() {
+        Some(last) if page.has_more => {
+            let created_at =
+                DateTime::from_timestamp(last.stored_event.event.created_at.as_secs() as i64, 0)
+                    .ok_or_else(|| internal_error("invalid event created_at"))?;
+            Some(encode_state_cursor(
+                created_at,
+                last.stored_event.event.id.as_bytes(),
+            ))
+        }
+        _ => None,
+    };
+    let complete = !page.has_more;
+
+    let content = serde_json::json!({
+        "entries": entries,
+        "cursor": cursor,
+        "complete": complete,
+    });
+    sign_response(&state, content)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -785,6 +1019,66 @@ mod tests {
         Some(event.id)
     }
 
+    /// Insert a kind-1 text note with an explicit `created_at` into a channel.
+    async fn insert_message_at(
+        db: &buzz_db::Db,
+        fixture: &ChannelFixture,
+        author: &Keys,
+        created_at: u64,
+    ) -> Option<EventId> {
+        let event = EventBuilder::new(Kind::TextNote, format!("msg-{created_at}"))
+            .custom_created_at(nostr::Timestamp::from(created_at))
+            .sign_with_keys(author)
+            .ok()?;
+        db.insert_event(fixture.community, &event, Some(fixture.channel_id))
+            .await
+            .ok()?;
+        Some(event.id)
+    }
+
+    /// Insert a reply with explicit thread metadata (parent + root).
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_reply(
+        db: &buzz_db::Db,
+        fixture: &ChannelFixture,
+        author: &Keys,
+        parent: &EventId,
+        parent_created_at: u64,
+        root: &EventId,
+        root_created_at: u64,
+        created_at: u64,
+    ) -> Option<EventId> {
+        let event = EventBuilder::new(Kind::TextNote, format!("reply-{created_at}"))
+            .tags([Tag::parse(["e", &parent.to_hex(), "", "reply"]).expect("e tag")])
+            .custom_created_at(nostr::Timestamp::from(created_at))
+            .sign_with_keys(author)
+            .ok()?;
+        let meta = buzz_db::event::ThreadMetadataParams {
+            event_id: event.id.as_bytes(),
+            event_created_at: DateTime::from_timestamp(created_at as i64, 0).expect("ts"),
+            channel_id: fixture.channel_id,
+            parent_event_id: Some(parent.as_bytes()),
+            parent_event_created_at: Some(
+                DateTime::from_timestamp(parent_created_at as i64, 0).expect("ts"),
+            ),
+            root_event_id: Some(root.as_bytes()),
+            root_event_created_at: Some(
+                DateTime::from_timestamp(root_created_at as i64, 0).expect("ts"),
+            ),
+            depth: 1,
+            broadcast: false,
+        };
+        db.insert_event_with_thread_metadata(
+            fixture.community,
+            &event,
+            Some(fixture.channel_id),
+            Some(meta),
+        )
+        .await
+        .ok()?;
+        Some(event.id)
+    }
+
     /// Standard NIP-98 Authorization header for a POST to `url` with `body`.
     fn nip98_auth_header(keys: &Keys, url: &str, body: &[u8]) -> String {
         let hash: [u8; 32] = Sha256::digest(body).into();
@@ -880,6 +1174,36 @@ mod tests {
         pubkey_hex: &str,
     ) -> axum::response::Response {
         let path = format!("/api/v1/relay/channels?pubkey={pubkey_hex}");
+        let url = format!("https://{host}{path}");
+        let auth = nip98_get_auth_header(keys, &url);
+        build_router(ts.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .header(header::HOST, host)
+                    .header(header::AUTHORIZATION, auth)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+    }
+
+    /// Drive one GET /api/v1/relay/state/events?<query> through the router,
+    /// signing the exact URL including the query string. `query` may be empty
+    /// for no query string.
+    async fn get_state_events(
+        ts: &TestState,
+        host: &str,
+        keys: &Keys,
+        query: &str,
+    ) -> axum::response::Response {
+        let path = if query.is_empty() {
+            "/api/v1/relay/state/events".to_string()
+        } else {
+            format!("/api/v1/relay/state/events?{query}")
+        };
         let url = format!("https://{host}{path}");
         let auth = nip98_get_auth_header(keys, &url);
         build_router(ts.state.clone())
@@ -2020,5 +2344,464 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn state_pages_cover_all_events_without_dupes_ascending() {
+        let host = format!("relay-state-paging-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        let channel = seed_channel(
+            &ts.state.db,
+            &host,
+            buzz_db::channel::ChannelVisibility::Open,
+        )
+        .await
+        .expect("channel");
+        let base = nostr::Timestamp::now().as_secs() - 120;
+        let mut seeded = Vec::new();
+        for i in 0..5 {
+            seeded.push(
+                insert_message_at(&ts.state.db, &channel, &channel.member_keys, base + i)
+                    .await
+                    .expect("message"),
+            );
+        }
+
+        let mut seen_ids: Vec<String> = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut pages = 0;
+        let mut prev_created_at: Option<i64> = None;
+        loop {
+            let query = match &cursor {
+                Some(c) => format!("limit=2&cursor={c}"),
+                None => "limit=2".to_string(),
+            };
+            let response = get_state_events(&ts, &host, &ts.service_keys, &query).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            let content = response_content(response).await;
+            let entries = content["entries"].as_array().expect("entries array");
+            pages += 1;
+            assert!(entries.len() <= 2, "page {pages} must respect limit=2");
+            for entry in entries {
+                let created_at = entry["event"]["created_at"]
+                    .as_i64()
+                    .expect("created_at on raw event");
+                if let Some(prev) = prev_created_at {
+                    assert!(created_at > prev, "created_at must ascend across pages");
+                }
+                prev_created_at = Some(created_at);
+                let id = entry["context"]["message_id"]
+                    .as_str()
+                    .expect("message_id")
+                    .to_string();
+                assert!(
+                    !seen_ids.contains(&id),
+                    "event {id} must not appear twice across pages"
+                );
+                seen_ids.push(id);
+            }
+            if content["complete"].as_bool().expect("complete") {
+                assert!(
+                    content["cursor"].is_null(),
+                    "final page must have cursor: null"
+                );
+                break;
+            }
+            cursor = Some(
+                content["cursor"]
+                    .as_str()
+                    .expect("non-final page has a cursor")
+                    .to_string(),
+            );
+            assert!(pages <= 10, "paging must terminate");
+        }
+
+        assert_eq!(pages, 3, "5 events at limit=2 needs 3 pages");
+        assert_eq!(seen_ids.len(), 5, "all seeded events seen exactly once");
+        for id in &seeded {
+            assert!(
+                seen_ids.contains(&id.to_hex()),
+                "seeded event {id} must be paged"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn state_since_filters_on_own_created_at() {
+        let host = format!("relay-state-since-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        let channel = seed_channel(
+            &ts.state.db,
+            &host,
+            buzz_db::channel::ChannelVisibility::Open,
+        )
+        .await
+        .expect("channel");
+        let base = nostr::Timestamp::now().as_secs() - 120;
+        let mut seeded = Vec::new();
+        for i in 0..4 {
+            seeded.push(
+                insert_message_at(&ts.state.db, &channel, &channel.member_keys, base + i * 10)
+                    .await
+                    .expect("message"),
+            );
+        }
+        let since = base + 15; // only the +20 and +30 events qualify
+
+        let response =
+            get_state_events(&ts, &host, &ts.service_keys, &format!("since={since}")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content = response_content(response).await;
+        let entries = content["entries"].as_array().expect("entries array");
+        assert_eq!(
+            entries.len(),
+            2,
+            "since must filter on the event's own created_at"
+        );
+        let ids: Vec<String> = entries
+            .iter()
+            .map(|e| e["context"]["message_id"].as_str().expect("id").to_string())
+            .collect();
+        assert!(ids.contains(&seeded[2].to_hex()));
+        assert!(ids.contains(&seeded[3].to_hex()));
+        assert!(content["complete"].as_bool().expect("complete"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn state_context_shape_and_channel_kind_mapping() {
+        let host = format!("relay-state-context-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        let community = ts
+            .state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("community")
+            .id;
+        let member_a = Keys::generate();
+        let member_b = Keys::generate();
+        let a_pk = member_a.public_key().to_bytes();
+        let b_pk = member_b.public_key().to_bytes();
+        let dm = ts
+            .state
+            .db
+            .create_dm(community, &[&a_pk, &b_pk], &a_pk)
+            .await
+            .expect("dm channel");
+        let private_ch = seed_channel(
+            &ts.state.db,
+            &host,
+            buzz_db::channel::ChannelVisibility::Private,
+        )
+        .await
+        .expect("private channel");
+        let open_ch = seed_channel(
+            &ts.state.db,
+            &host,
+            buzz_db::channel::ChannelVisibility::Open,
+        )
+        .await
+        .expect("open channel");
+
+        let base = nostr::Timestamp::now().as_secs() - 120;
+        let dm_fixture = ChannelFixture {
+            community,
+            channel_id: dm.id,
+            member_keys: member_a.clone(),
+        };
+        let dm_msg = insert_message_at(&ts.state.db, &dm_fixture, &member_a, base)
+            .await
+            .expect("dm message");
+        let priv_msg =
+            insert_message_at(&ts.state.db, &private_ch, &private_ch.member_keys, base + 1)
+                .await
+                .expect("private message");
+        let open_msg = insert_message_at(&ts.state.db, &open_ch, &open_ch.member_keys, base + 2)
+            .await
+            .expect("open message");
+        let reply = insert_reply(
+            &ts.state.db,
+            &open_ch,
+            &open_ch.member_keys,
+            &open_msg,
+            base + 2,
+            &open_msg,
+            base + 2,
+            base + 3,
+        )
+        .await
+        .expect("reply");
+
+        let response = get_state_events(&ts, &host, &ts.service_keys, "limit=10").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content = response_content(response).await;
+        let entries = content["entries"].as_array().expect("entries array");
+        assert_eq!(entries.len(), 4);
+
+        for entry in entries {
+            let ctx = &entry["context"];
+            assert!(ctx["community_id"].is_string());
+            assert!(ctx["channel_id"].is_string());
+            assert!(ctx["channel_kind"].is_string());
+            assert!(ctx["thread_root_id"].is_null() || ctx["thread_root_id"].is_string());
+            assert!(ctx["message_id"].is_string());
+            assert!(ctx["event_type"].is_string());
+            assert!(
+                ctx["supersedes_event_id"].is_null(),
+                "supersedes_event_id is always null in v1alpha1"
+            );
+            assert_eq!(ctx["community_id"], community.to_string());
+            assert_eq!(ctx["message_id"], entry["event"]["id"]);
+        }
+
+        let dm_entry = entries
+            .iter()
+            .find(|e| e["context"]["message_id"] == dm_msg.to_hex())
+            .expect("dm entry");
+        assert_eq!(dm_entry["context"]["channel_kind"], "dm");
+        assert_eq!(dm_entry["context"]["channel_id"], dm.id.to_string());
+        assert!(dm_entry["context"]["thread_root_id"].is_null());
+
+        let priv_entry = entries
+            .iter()
+            .find(|e| e["context"]["message_id"] == priv_msg.to_hex())
+            .expect("private entry");
+        assert_eq!(priv_entry["context"]["channel_kind"], "private");
+        assert_eq!(
+            priv_entry["context"]["channel_id"],
+            private_ch.channel_id.to_string()
+        );
+        assert!(priv_entry["context"]["thread_root_id"].is_null());
+
+        let open_entry = entries
+            .iter()
+            .find(|e| e["context"]["message_id"] == open_msg.to_hex())
+            .expect("open entry");
+        assert_eq!(open_entry["context"]["channel_kind"], "workspace");
+        assert!(open_entry["context"]["thread_root_id"].is_null());
+
+        let reply_entry = entries
+            .iter()
+            .find(|e| e["context"]["message_id"] == reply.to_hex())
+            .expect("reply entry");
+        assert_eq!(reply_entry["context"]["channel_kind"], "workspace");
+        assert_eq!(
+            reply_entry["context"]["thread_root_id"],
+            open_msg.to_hex(),
+            "reply must carry its thread root"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn state_deleted_event_included_with_deleted_type() {
+        let host = format!("relay-state-deleted-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        let channel = seed_channel(
+            &ts.state.db,
+            &host,
+            buzz_db::channel::ChannelVisibility::Open,
+        )
+        .await
+        .expect("channel");
+        let base = nostr::Timestamp::now().as_secs() - 120;
+        let first = insert_message_at(&ts.state.db, &channel, &channel.member_keys, base)
+            .await
+            .expect("first message");
+        insert_message_at(&ts.state.db, &channel, &channel.member_keys, base + 1)
+            .await
+            .expect("second message");
+        ts.state
+            .db
+            .soft_delete_event(channel.community, &first.to_bytes())
+            .await
+            .expect("soft delete");
+
+        let response = get_state_events(&ts, &host, &ts.service_keys, "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content = response_content(response).await;
+        let entries = content["entries"].as_array().expect("entries array");
+        assert_eq!(entries.len(), 2, "tombstoned events must still be paged");
+        let deleted_entry = entries
+            .iter()
+            .find(|e| e["context"]["message_id"] == first.to_hex())
+            .expect("deleted event entry");
+        assert_eq!(deleted_entry["context"]["event_type"], "deleted");
+        let live_entry = entries
+            .iter()
+            .find(|e| e["context"]["message_id"] != first.to_hex())
+            .expect("live event entry");
+        assert_eq!(live_entry["context"]["event_type"], "created");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn state_limit_is_clamped_not_errored() {
+        let host = format!("relay-state-limit-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        let channel = seed_channel(
+            &ts.state.db,
+            &host,
+            buzz_db::channel::ChannelVisibility::Open,
+        )
+        .await
+        .expect("channel");
+        let base = nostr::Timestamp::now().as_secs() - 120;
+        for i in 0..3 {
+            insert_message_at(&ts.state.db, &channel, &channel.member_keys, base + i)
+                .await
+                .expect("message");
+        }
+
+        // limit=0 → clamped to 1 (no error).
+        let response = get_state_events(&ts, &host, &ts.service_keys, "limit=0").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content = response_content(response).await;
+        assert_eq!(content["entries"].as_array().expect("entries").len(), 1);
+
+        // limit=10000 → clamped to 500 (no error; 3 events fit).
+        let response = get_state_events(&ts, &host, &ts.service_keys, "limit=10000").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content = response_content(response).await;
+        let entries = content["entries"].as_array().expect("entries");
+        assert!(entries.len() <= 500);
+        assert_eq!(entries.len(), 3);
+        assert!(content["complete"].as_bool().expect("complete"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn state_malformed_cursor_and_auth_failures() {
+        let host = format!("relay-state-auth-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+
+        // Malformed cursor: not base64.
+        let response =
+            get_state_events(&ts, &host, &ts.service_keys, "cursor=%%%not-base64%%%").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Malformed cursor: base64 of garbage without the separator.
+        let garbage = BASE64.encode("not-a-cursor");
+        let response =
+            get_state_events(&ts, &host, &ts.service_keys, &format!("cursor={garbage}")).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Missing Authorization header.
+        let response = build_router(ts.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/relay/state/events")
+                    .header(header::HOST, &host)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // Untrusted caller.
+        let impostor = Keys::generate();
+        let response = get_state_events(&ts, &host, &impostor, "").await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn state_cross_community_excludes_other_community() {
+        let host_a = format!("relay-state-a-{}.test", Uuid::new_v4().simple());
+        let host_b = format!("relay-state-b-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host_a).await.expect("test state");
+        let channel = seed_channel(
+            &ts.state.db,
+            &host_a,
+            buzz_db::channel::ChannelVisibility::Open,
+        )
+        .await
+        .expect("channel in A");
+        insert_message_at(
+            &ts.state.db,
+            &channel,
+            &channel.member_keys,
+            nostr::Timestamp::now().as_secs() - 10,
+        )
+        .await
+        .expect("message in A");
+        ts.state
+            .db
+            .ensure_configured_community(&host_b)
+            .await
+            .expect("community B");
+
+        let response = get_state_events(&ts, &host_b, &ts.service_keys, "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content = response_content(response).await;
+        assert_eq!(
+            content["entries"].as_array().expect("entries").len(),
+            0,
+            "another community's events must never be paged"
+        );
+        assert!(content["complete"].as_bool().expect("complete"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn state_response_is_signed_event_with_verifiable_events() {
+        let host = format!("relay-state-verify-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        let channel = seed_channel(
+            &ts.state.db,
+            &host,
+            buzz_db::channel::ChannelVisibility::Open,
+        )
+        .await
+        .expect("channel");
+        let message = insert_message_at(
+            &ts.state.db,
+            &channel,
+            &channel.member_keys,
+            nostr::Timestamp::now().as_secs() - 10,
+        )
+        .await
+        .expect("message");
+
+        let response = get_state_events(&ts, &host, &ts.service_keys, "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read response body");
+        let raw = String::from_utf8(bytes.to_vec()).expect("response is UTF-8");
+        let envelope: nostr::Event = serde_json::from_str(&raw).expect("response is a Nostr event");
+        assert_eq!(
+            envelope.kind,
+            Kind::Custom(KIND_RELAY_AUTHZ_RESPONSE as u16),
+            "kind must be 19030"
+        );
+        assert_eq!(envelope.pubkey, ts.relay_pubkey, "signed by the relay key");
+        envelope
+            .verify()
+            .expect("event id and signature must verify");
+
+        let content: Value = serde_json::from_str(&envelope.content).expect("content is JSON");
+        assert!(
+            content["evaluated_at"].is_null(),
+            "state/events content has no evaluated_at field"
+        );
+        let entries = content["entries"].as_array().expect("entries array");
+        assert_eq!(entries.len(), 1);
+        let raw_event: nostr::Event =
+            serde_json::from_value(entries[0]["event"].clone()).expect("entry event parses");
+        assert_eq!(raw_event.kind, Kind::TextNote, "entry is a kind-1 event");
+        assert_eq!(
+            raw_event.id, message,
+            "entry event id matches the seeded event"
+        );
+        raw_event
+            .verify()
+            .expect("entry event id and signature must verify");
     }
 }
