@@ -1,11 +1,13 @@
-//! Relay authorization API — `POST /api/v1/relay/access/check` and
-//! `POST /api/v1/relay/access/check-batch`.
+//! Relay authorization API — `POST /api/v1/relay/access/check`,
+//! `POST /api/v1/relay/access/check-batch`, and
+//! `GET /api/v1/relay/channels` (the authoritative channel registry).
 //!
 //! Lets a provisioned trusted service workload (which never holds a human
 //! user's signing key) ask the relay whether a given pubkey may currently read
-//! a given channel/message. The decision derives exclusively from the relay's
-//! own state (channel visibility, membership, message availability); the
-//! request's `channel_kind` is never trusted.
+//! a given channel/message, or enumerate the channels that pubkey may read.
+//! The answers derive exclusively from the relay's own state (channel
+//! visibility, membership, message availability); the request's `channel_kind`
+//! is never trusted.
 //!
 //! Authentication is NIP-98 (kind-27235) and the caller must be in the
 //! deployment's `relay_trusted_service_pubkeys` allowlist (empty allowlist =
@@ -21,7 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::{
-    extract::State,
+    extract::{Query, RawQuery, State},
     http::{HeaderMap, StatusCode},
     response::Json,
 };
@@ -44,6 +46,9 @@ use super::{api_error, internal_error};
 const ACCESS_CHECK_PATH: &str = "/api/v1/relay/access/check";
 /// The batch endpoint path — the NIP-98 `u` tag must match the exact request URL.
 const ACCESS_CHECK_BATCH_PATH: &str = "/api/v1/relay/access/check-batch";
+/// The channel-registry endpoint path — the NIP-98 `u` tag must match the
+/// exact request URL including the query string.
+const RELAY_CHANNELS_PATH: &str = "/api/v1/relay/channels";
 /// Maximum number of checks per batch request (contract: at most 64).
 const MAX_BATCH_CHECKS: usize = 64;
 
@@ -469,6 +474,110 @@ fn batch_response(
     sign_response(state, content)
 }
 
+/// Query for `GET /api/v1/relay/channels`.
+#[derive(serde::Deserialize)]
+pub struct ChannelsQuery {
+    /// 64-hex pubkey to list channels for.
+    pubkey: String,
+}
+
+/// List the channels a given pubkey may currently read — the authoritative
+/// channel registry.
+///
+/// NIP-98 GET: the `u` tag covers the exact request URL INCLUDING the query
+/// string, so the `pubkey` parameter is bound by the signature (GET carries
+/// no `payload` tag). Returns one kind-19030 event signed by the relay key
+/// whose `content` lists only channels the pubkey may read — member channels
+/// (including private ones) plus open channels, each with a `member` flag
+/// stating active membership — and echoes the query `pubkey` verbatim.
+/// Host-derived community only; untrusted callers get 401 (same
+/// trusted-service gate as the check endpoints). Existence hiding: channels
+/// the pubkey may not read are never included, and neither are another
+/// community's channels.
+pub async fn list_channels(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+    Query(query): Query<ChannelsQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Row zero: the community is derived from the request Host, never from
+    // client-supplied ids.
+    let raw_host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let tenant = crate::tenant::bind_community(&state.db, raw_host)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "relay: no community is configured for this host",
+            )
+        })?;
+
+    // NIP-98 (kind-27235), pinned mandatory — no dev-mode X-Pubkey fallback.
+    // The `u` tag covers path + raw query string (same construction as the
+    // moderation GETs in `bridge.rs`), so the signed `pubkey` cannot be
+    // swapped after the fact.
+    let path_with_query = match raw_query {
+        Some(q) if !q.is_empty() => format!("{RELAY_CHANNELS_PATH}?{q}"),
+        _ => RELAY_CHANNELS_PATH.to_string(),
+    };
+    let url = nip98_expected_url(&state.config.relay_url, &tenant, &path_with_query);
+    let (caller_pubkey, event_id_bytes) = verify_bridge_auth(&headers, "GET", &url, None, true)?;
+
+    // Trusted-service gate: only provisioned service pubkeys may call the
+    // authorization API. An empty allowlist disables it entirely (fail closed).
+    let caller_hex = caller_pubkey.to_hex();
+    if !state
+        .config
+        .relay_trusted_service_pubkeys
+        .iter()
+        .any(|trusted| trusted == &caller_hex)
+    {
+        return Err(api_error(StatusCode::UNAUTHORIZED, "untrusted caller"));
+    }
+
+    // Admission (rate limit) and NIP-98 replay protection.
+    enforce_http_admission(&state, &tenant, &caller_pubkey).await?;
+    check_nip98_replay(&state, &tenant, event_id_bytes).await?;
+
+    let subject = nostr::PublicKey::from_hex(&query.pubkey)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid pubkey"))?;
+    let evaluated_at = nostr::Timestamp::now().as_secs() as i64;
+
+    // One query: member ∪ open channels of this community (non-deleted), with
+    // the per-channel `is_member` flag computed in the same statement. DM
+    // channels the pubkey has hidden (`channel_members.hidden_at` set) are
+    // excluded by the query itself; other users' DM channels are never
+    // readable, so they never appear.
+    let accessible = state
+        .db
+        .get_accessible_channels(tenant.community(), &subject.to_bytes(), None, None)
+        .await
+        .map_err(|e| internal_error(&format!("accessible channels lookup failed: {e}")))?;
+
+    let channels_json: Vec<Value> = accessible
+        .iter()
+        .map(|ac| {
+            serde_json::json!({
+                "channel_id": ac.channel.id.to_string(),
+                "name": &ac.channel.name,
+                "channel_type": &ac.channel.channel_type,
+                "visibility": &ac.channel.visibility,
+                "member": ac.is_member,
+            })
+        })
+        .collect();
+
+    let content = serde_json::json!({
+        "channels": channels_json,
+        "evaluated_at": evaluated_at,
+        "pubkey": &query.pubkey,
+    });
+    sign_response(&state, content)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -597,17 +706,27 @@ mod tests {
     }
 
     /// Seed a community (fresh host), a channel, and one member; the channel
-    /// creator is bootstrapped as owner.
+    /// creator is bootstrapped as owner. The member is a fresh random key.
     async fn seed_channel(
         db: &buzz_db::Db,
         host: &str,
         visibility: buzz_db::channel::ChannelVisibility,
     ) -> Option<ChannelFixture> {
+        seed_channel_with_member(db, host, visibility, &Keys::generate()).await
+    }
+
+    /// [`seed_channel`] with an explicit member key (e.g. the subject under
+    /// test) added as the channel's member.
+    async fn seed_channel_with_member(
+        db: &buzz_db::Db,
+        host: &str,
+        visibility: buzz_db::channel::ChannelVisibility,
+        member: &Keys,
+    ) -> Option<ChannelFixture> {
         let community = db.ensure_configured_community(host).await.ok()?.id;
         let creator_keys = Keys::generate();
-        let member_keys = Keys::generate();
         let creator_pk = creator_keys.public_key().to_bytes().to_vec();
-        let member_pk = member_keys.public_key().to_bytes().to_vec();
+        let member_pk = member.public_key().to_bytes().to_vec();
         db.ensure_user(community, &creator_pk).await.ok()?;
         db.ensure_user(community, &member_pk).await.ok()?;
         let channel_id = Uuid::new_v4();
@@ -635,7 +754,7 @@ mod tests {
         Some(ChannelFixture {
             community,
             channel_id,
-            member_keys,
+            member_keys: member.clone(),
         })
     }
 
@@ -735,6 +854,46 @@ mod tests {
             .await
             .expect("read response body");
         serde_json::from_slice(&bytes).expect("response JSON")
+    }
+
+    /// NIP-98 Authorization header for a GET — contract: no `payload` tag.
+    fn nip98_get_auth_header(keys: &Keys, url: &str) -> String {
+        let tags = vec![
+            Tag::parse(["u", url]).expect("u tag"),
+            Tag::parse(["method", "GET"]).expect("method tag"),
+        ];
+        let event = EventBuilder::new(Kind::HttpAuth, "")
+            .tags(tags)
+            .sign_with_keys(keys)
+            .expect("sign NIP-98 event");
+        let event_json = serde_json::to_string(&event).expect("serialize NIP-98 event");
+        let encoded = BASE64.encode(event_json.as_bytes());
+        format!("Nostr {encoded}")
+    }
+
+    /// Drive one GET /api/v1/relay/channels?pubkey=<hex> through the router,
+    /// signing the exact URL including the query string.
+    async fn get_channels(
+        ts: &TestState,
+        host: &str,
+        keys: &Keys,
+        pubkey_hex: &str,
+    ) -> axum::response::Response {
+        let path = format!("/api/v1/relay/channels?pubkey={pubkey_hex}");
+        let url = format!("https://{host}{path}");
+        let auth = nip98_get_auth_header(keys, &url);
+        build_router(ts.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .header(header::HOST, host)
+                    .header(header::AUTHORIZATION, auth)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
     }
 
     /// Parse the signed event's `content` field (a JSON string) into a Value.
@@ -1508,6 +1667,358 @@ mod tests {
         assert!(
             content["evaluated_at"].as_i64().is_some(),
             "empty batch still carries the freshness authority"
+        );
+    }
+
+    /// Map channel_id → entry from a registry response `content`.
+    fn registry_map(content: &Value) -> std::collections::HashMap<String, &Value> {
+        content["channels"]
+            .as_array()
+            .expect("channels array")
+            .iter()
+            .map(|entry| {
+                (
+                    entry["channel_id"]
+                        .as_str()
+                        .expect("channel_id string")
+                        .to_string(),
+                    entry,
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn registry_member_sees_private_and_open_with_member_flags() {
+        let host = format!("relay-channels-member-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        let subject = Keys::generate();
+        let private_ch = seed_channel_with_member(
+            &ts.state.db,
+            &host,
+            buzz_db::channel::ChannelVisibility::Private,
+            &subject,
+        )
+        .await
+        .expect("private member channel");
+        let open_member = seed_channel_with_member(
+            &ts.state.db,
+            &host,
+            buzz_db::channel::ChannelVisibility::Open,
+            &subject,
+        )
+        .await
+        .expect("open member channel");
+        let open_nonmember = seed_channel(
+            &ts.state.db,
+            &host,
+            buzz_db::channel::ChannelVisibility::Open,
+        )
+        .await
+        .expect("open non-member channel");
+        let private_other = seed_channel(
+            &ts.state.db,
+            &host,
+            buzz_db::channel::ChannelVisibility::Private,
+        )
+        .await
+        .expect("private other channel");
+
+        let response =
+            get_channels(&ts, &host, &ts.service_keys, &subject.public_key().to_hex()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content = response_content(response).await;
+        let by_id = registry_map(&content);
+
+        let priv_entry = by_id
+            .get(&private_ch.channel_id.to_string())
+            .expect("private member channel must be listed");
+        assert_eq!(priv_entry["member"], true);
+        assert_eq!(priv_entry["visibility"], "private");
+
+        let open_entry = by_id
+            .get(&open_member.channel_id.to_string())
+            .expect("open member channel must be listed");
+        assert_eq!(open_entry["member"], true);
+        assert_eq!(open_entry["visibility"], "open");
+
+        let open_nm_entry = by_id
+            .get(&open_nonmember.channel_id.to_string())
+            .expect("open non-member channel must be listed");
+        assert_eq!(open_nm_entry["member"], false);
+
+        assert!(
+            !by_id.contains_key(&private_other.channel_id.to_string()),
+            "private channel the subject is not a member of must be absent"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn registry_non_member_sees_only_open_channels() {
+        let host = format!("relay-channels-nonmember-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        let subject = Keys::generate();
+        let private_ch = seed_channel(
+            &ts.state.db,
+            &host,
+            buzz_db::channel::ChannelVisibility::Private,
+        )
+        .await
+        .expect("private channel");
+        let open_ch = seed_channel(
+            &ts.state.db,
+            &host,
+            buzz_db::channel::ChannelVisibility::Open,
+        )
+        .await
+        .expect("open channel");
+
+        let response =
+            get_channels(&ts, &host, &ts.service_keys, &subject.public_key().to_hex()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content = response_content(response).await;
+        let by_id = registry_map(&content);
+
+        let open_entry = by_id
+            .get(&open_ch.channel_id.to_string())
+            .expect("open channel must be listed for a non-member");
+        assert_eq!(open_entry["member"], false);
+
+        assert!(
+            !by_id.contains_key(&private_ch.channel_id.to_string()),
+            "private channel must be absent for a non-member"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn registry_dm_and_hidden_channels_of_others_absent() {
+        let host = format!("relay-channels-dm-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        let community = ts
+            .state
+            .db
+            .ensure_configured_community(&host)
+            .await
+            .expect("community")
+            .id;
+        let subject = Keys::generate();
+        let other_a = Keys::generate();
+        let other_b = Keys::generate();
+        let subject_pk = subject.public_key().to_bytes();
+        let a_pk = other_a.public_key().to_bytes();
+        let b_pk = other_b.public_key().to_bytes();
+        // DM between two other users — the subject must never see it.
+        let dm_other = ts
+            .state
+            .db
+            .create_dm(community, &[&a_pk, &b_pk], &a_pk)
+            .await
+            .expect("DM of other users");
+        // Visible DM the subject participates in — must be listed.
+        let dm_visible = ts
+            .state
+            .db
+            .create_dm(community, &[&subject_pk, &a_pk], &subject_pk)
+            .await
+            .expect("visible DM");
+        // DM the subject participates in but has hidden — must be absent.
+        let dm_hidden = ts
+            .state
+            .db
+            .create_dm(community, &[&subject_pk, &b_pk], &subject_pk)
+            .await
+            .expect("hidden DM");
+        ts.state
+            .db
+            .hide_dm(community, dm_hidden.id, &subject_pk)
+            .await
+            .expect("hide DM");
+
+        let response =
+            get_channels(&ts, &host, &ts.service_keys, &subject.public_key().to_hex()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content = response_content(response).await;
+        let by_id = registry_map(&content);
+
+        assert!(
+            !by_id.contains_key(&dm_other.id.to_string()),
+            "a DM the subject is not part of must be absent"
+        );
+        assert!(
+            !by_id.contains_key(&dm_hidden.id.to_string()),
+            "a DM the subject has hidden must be absent"
+        );
+        let visible = by_id
+            .get(&dm_visible.id.to_string())
+            .expect("visible DM must be listed");
+        assert_eq!(visible["member"], true);
+        assert_eq!(visible["channel_type"], "dm");
+        assert_eq!(visible["visibility"], "private");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn registry_cross_community_excludes_other_community() {
+        let host_a = format!("relay-channels-a-{}.test", Uuid::new_v4().simple());
+        let host_b = format!("relay-channels-b-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host_a).await.expect("test state");
+        let member = seed_channel(
+            &ts.state.db,
+            &host_a,
+            buzz_db::channel::ChannelVisibility::Open,
+        )
+        .await
+        .expect("channel in A");
+        ts.state
+            .db
+            .ensure_configured_community(&host_b)
+            .await
+            .expect("community B");
+
+        // Request Host = community B — A's channels must never be included.
+        let response = get_channels(
+            &ts,
+            &host_b,
+            &ts.service_keys,
+            &member.member_keys.public_key().to_hex(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content = response_content(response).await;
+        assert_eq!(
+            content["channels"]
+                .as_array()
+                .expect("channels array")
+                .len(),
+            0,
+            "another community's channels must never be listed"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn registry_untrusted_caller_is_unauthorized() {
+        let host = format!("relay-channels-trust-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        let impostor = Keys::generate();
+
+        let response = get_channels(
+            &ts,
+            &host,
+            &impostor,
+            &Keys::generate().public_key().to_hex(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn registry_malformed_or_missing_pubkey_is_bad_request() {
+        let host = format!("relay-channels-query-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+
+        // Malformed (non-hex) pubkey parameter.
+        let response = get_channels(&ts, &host, &ts.service_keys, "not-a-pubkey").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Missing pubkey parameter entirely (query absent from the signed URL).
+        let path = "/api/v1/relay/channels";
+        let url = format!("https://{host}{path}");
+        let auth = nip98_get_auth_header(&ts.service_keys, &url);
+        let response = build_router(ts.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .header(header::HOST, &host)
+                    .header(header::AUTHORIZATION, auth)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn registry_response_is_signed_event_with_all_fields() {
+        let host = format!("relay-channels-verify-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        let subject = Keys::generate();
+        seed_channel_with_member(
+            &ts.state.db,
+            &host,
+            buzz_db::channel::ChannelVisibility::Open,
+            &subject,
+        )
+        .await
+        .expect("member channel");
+        let subject_hex = subject.public_key().to_hex();
+
+        let response = get_channels(&ts, &host, &ts.service_keys, &subject_hex).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read response body");
+        let raw = String::from_utf8(bytes.to_vec()).expect("response is UTF-8");
+        let event: nostr::Event = serde_json::from_str(&raw).expect("response is a Nostr event");
+        assert_eq!(
+            event.kind,
+            Kind::Custom(KIND_RELAY_AUTHZ_RESPONSE as u16),
+            "kind must be 19030"
+        );
+        assert_eq!(event.pubkey, ts.relay_pubkey, "signed by the relay key");
+        event.verify().expect("event id and signature must verify");
+
+        let content: Value = serde_json::from_str(&event.content).expect("content is JSON");
+        assert_eq!(content["pubkey"], subject_hex, "echoes the query pubkey");
+        let evaluated_at = content["evaluated_at"]
+            .as_i64()
+            .expect("evaluated_at is unix seconds");
+        let now = nostr::Timestamp::now().as_secs() as i64;
+        assert!(
+            (now - evaluated_at).abs() <= 60,
+            "evaluated_at must be recent; got {evaluated_at}, now {now}"
+        );
+        let channels = content["channels"].as_array().expect("channels array");
+        assert!(!channels.is_empty());
+        for entry in channels {
+            assert!(entry["channel_id"].is_string(), "channel_id present");
+            assert!(entry["name"].is_string(), "name present");
+            assert!(entry["channel_type"].is_string(), "channel_type present");
+            assert!(entry["visibility"].is_string(), "visibility present");
+            assert!(entry["member"].is_boolean(), "member present");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn registry_no_channels_yields_empty_list() {
+        let host = format!("relay-channels-empty-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        let stranger = Keys::generate();
+
+        let response = get_channels(
+            &ts,
+            &host,
+            &ts.service_keys,
+            &stranger.public_key().to_hex(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content = response_content(response).await;
+        assert_eq!(
+            content["channels"]
+                .as_array()
+                .expect("channels array")
+                .len(),
+            0
         );
     }
 }
