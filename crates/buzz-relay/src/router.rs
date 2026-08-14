@@ -125,6 +125,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/api/v1/relay/channels",
             get(api::relay_access::list_channels),
         )
+        .route(
+            "/api/v1/relay/state/events",
+            get(api::relay_access::page_state),
+        )
         // Moderation queue reads (NIP-98 auth + mod-authz gate, L6)
         .route("/moderation/reports", get(api::bridge::moderation_reports))
         .route("/moderation/audit", get(api::bridge::moderation_audit))
