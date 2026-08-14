@@ -27,7 +27,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::Json,
 };
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use serde_json::Value;
@@ -594,8 +594,8 @@ pub struct StateEventsQuery {
     since: Option<i64>,
     /// Maximum page size, clamped to 1..=[`STATE_EVENTS_MAX_LIMIT`].
     limit: Option<i64>,
-    /// Opaque continuation token from a previous page (base64 of
-    /// `<created_at_unix>:<event_id_hex>`).
+    /// Opaque continuation token from a previous page (base64url, no padding,
+    /// of `<created_at_unix>:<event_id_hex>`).
     cursor: Option<String>,
 }
 
@@ -609,19 +609,22 @@ struct StateCursor {
 
 /// Encode the opaque state-events cursor for the last row of a page.
 ///
-/// Format: base64 of `"<created_at_unix>:<event_id_hex>"` — documented here
-/// as the wire contract for the endpoint.
+/// Format: base64url without padding (`-`/`_`, never `+`/`/` or `=`) of
+/// `"<created_at_unix>:<event_id_hex>"` — documented here as the wire
+/// contract for the endpoint. URL-safe so the cursor survives percent-
+/// encoding in the query component unchanged.
 fn encode_state_cursor(created_at: DateTime<Utc>, id: &[u8]) -> String {
     let text = format!("{}:{}", created_at.timestamp(), hex::encode(id));
-    BASE64.encode(text)
+    URL_SAFE_NO_PAD.encode(text)
 }
 
 /// Parse an opaque state-events cursor back into its keyset position.
 ///
-/// Malformed cursors (bad base64, missing separator, non-numeric timestamp,
-/// non-hex id) fail closed with 400 — never silently restart the paging.
+/// Malformed cursors (bad base64url, missing separator, non-numeric
+/// timestamp, non-hex id) fail closed with 400 — never silently restart the
+/// paging.
 fn parse_state_cursor(raw: &str) -> Result<StateCursor, (StatusCode, Json<Value>)> {
-    let decoded = BASE64
+    let decoded = URL_SAFE_NO_PAD
         .decode(raw)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid cursor"))?;
     let text = String::from_utf8(decoded)
@@ -675,7 +678,7 @@ fn map_channel_kind(channel_type: &str, visibility: &str) -> &'static str {
 /// Paging is keyset-ordered by `(created_at ASC, event_id ASC)` over the
 /// event's own `created_at`; `since` filters inclusively on it and `limit`
 /// is clamped to 1..=500 (out-of-range values clamp, never error). The
-/// cursor is opaque base64 of `<created_at_unix>:<event_id_hex>`; the final
+/// cursor is opaque base64url (no padding) of `<created_at_unix>:<event_id_hex>`; the final
 /// page reports `complete: true, cursor: null` (never `cursor: null` with
 /// `complete: false`). Only the Host-derived community's channel-scoped
 /// kind-1 events are paged; events of soft-deleted channels are excluded.
@@ -820,7 +823,10 @@ mod tests {
         body::{to_bytes, Body},
         http::{header, Request, StatusCode},
     };
-    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+    use base64::{
+        engine::general_purpose::{STANDARD as BASE64, URL_SAFE_NO_PAD},
+        Engine,
+    };
     use buzz_auth::Nip98ReplayGuard;
     use buzz_core::CommunityId;
     use nostr::{EventBuilder, EventId, Keys, Kind, Tag};
@@ -2414,6 +2420,11 @@ mod tests {
                     .expect("non-final page has a cursor")
                     .to_string(),
             );
+            let cursor_str = cursor.as_ref().expect("cursor set");
+            assert!(
+                !cursor_str.contains(['+', '/', '=']),
+                "cursor must be base64url without padding; got {cursor_str}"
+            );
             assert!(pages <= 10, "paging must terminate");
         }
 
@@ -2425,6 +2436,75 @@ mod tests {
                 "seeded event {id} must be paged"
             );
         }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn state_same_second_events_tie_break_by_id() {
+        let host = format!("relay-state-tie-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        let channel = seed_channel(
+            &ts.state.db,
+            &host,
+            buzz_db::channel::ChannelVisibility::Open,
+        )
+        .await
+        .expect("channel");
+        let same_ts = nostr::Timestamp::now().as_secs() - 60;
+
+        // Two distinct events with the SAME created_at — distinct content so
+        // the deterministic signatures produce distinct ids.
+        let mut events = Vec::new();
+        for content in ["tie-a", "tie-b"] {
+            let event = EventBuilder::new(Kind::TextNote, content)
+                .custom_created_at(nostr::Timestamp::from(same_ts))
+                .sign_with_keys(&channel.member_keys)
+                .expect("sign");
+            ts.state
+                .db
+                .insert_event(channel.community, &event, Some(channel.channel_id))
+                .await
+                .expect("insert");
+            events.push(event.id);
+        }
+        let (smaller, larger) = if events[0].to_hex() < events[1].to_hex() {
+            (events[0], events[1])
+        } else {
+            (events[1], events[0])
+        };
+
+        // Page with limit=1 twice — the (created_at, id) keyset must break
+        // the same-second tie by ascending id, returning each event exactly
+        // once across the two pages.
+        let first =
+            response_content(get_state_events(&ts, &host, &ts.service_keys, "limit=1").await).await;
+        assert_eq!(first["entries"].as_array().expect("entries").len(), 1);
+        assert!(!first["complete"].as_bool().expect("complete"));
+        assert_eq!(
+            first["entries"][0]["context"]["message_id"],
+            smaller.to_hex(),
+            "same-second events must order by ascending id"
+        );
+        let cursor = first["cursor"].as_str().expect("cursor").to_string();
+
+        let second = response_content(
+            get_state_events(
+                &ts,
+                &host,
+                &ts.service_keys,
+                &format!("limit=1&cursor={cursor}"),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(second["entries"].as_array().expect("entries").len(), 1);
+        assert!(second["complete"].as_bool().expect("complete"));
+        assert!(second["cursor"].is_null());
+        assert_eq!(
+            second["entries"][0]["context"]["message_id"],
+            larger.to_hex(),
+            "second page must return the remaining same-second event"
+        );
     }
 
     #[tokio::test]
@@ -2683,8 +2763,8 @@ mod tests {
             get_state_events(&ts, &host, &ts.service_keys, "cursor=%%%not-base64%%%").await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-        // Malformed cursor: base64 of garbage without the separator.
-        let garbage = BASE64.encode("not-a-cursor");
+        // Malformed cursor: base64url of garbage without the separator.
+        let garbage = URL_SAFE_NO_PAD.encode("not-a-cursor");
         let response =
             get_state_events(&ts, &host, &ts.service_keys, &format!("cursor={garbage}")).await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);

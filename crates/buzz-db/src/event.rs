@@ -1155,6 +1155,12 @@ pub async fn query_state_events(
         qb.push_bind(id);
         qb.push("))");
     }
+    // The page-size bound must be self-contained: the limit+1 probe below
+    // overflows on usize::MAX. The endpoint clamps to 1..=500 before calling.
+    debug_assert!(
+        limit <= 500,
+        "state events page limit must be clamped by the caller"
+    );
     qb.push(" ORDER BY e.created_at ASC, e.id ASC LIMIT ");
     qb.push_bind((limit + 1) as i64);
 
