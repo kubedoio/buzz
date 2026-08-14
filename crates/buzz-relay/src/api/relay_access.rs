@@ -897,7 +897,19 @@ mod tests {
 
         let pool = sqlx::PgPool::connect(&database_url).await.ok()?;
         let db = buzz_db::Db::from_pool(pool.clone());
-        db.migrate().await.ok()?;
+        // The CI integration job pre-applies the schema via pgschema, which
+        // records no sqlx migration bookkeeping — re-running the embedded
+        // migrations there fails on `CREATE TYPE` collisions. A fresh local
+        // test DB needs them. Migrate only when the schema is absent.
+        let schema_present: Option<String> =
+            sqlx::query_scalar("SELECT to_regclass('communities')::text")
+                .fetch_optional(&pool)
+                .await
+                .ok()
+                .flatten();
+        if schema_present.is_none() {
+            db.migrate().await.ok()?;
+        }
         db.ensure_configured_community(host).await.ok()?;
 
         let redis_pool = deadpool_redis::Config::from_url(&config.redis_url)
