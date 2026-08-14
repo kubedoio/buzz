@@ -403,6 +403,14 @@ pub const KIND_NIP43_MEMBER_REMOVED: u32 = 8001;
 /// NIP-43: User leave request (user-signed, ephemeral).
 pub const KIND_NIP43_LEAVE_REQUEST: u32 = 28936;
 
+// Relay authorization API response envelopes (relay-signed, unregistered
+// private replaceable-range kind). Never stored or published to subscribers;
+// returned inline over HTTP by the `/api/v1/relay/*` authorization endpoints.
+/// Kind 19030: relay-signed authorization API response (unregistered private
+/// replaceable-range kind). Never published to subscribers; returned inline
+/// over HTTP by the `/api/v1/relay/*` authorization endpoints.
+pub const KIND_RELAY_AUTHZ_RESPONSE: u32 = 19030;
+
 // NIP-IA identity archival requests (user/agent/owner-signed)
 /// NIP-IA: Request that the relay archive a target identity.
 pub const KIND_IA_ARCHIVE_REQUEST: u32 = 9035;
