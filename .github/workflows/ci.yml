@@ -692,6 +692,21 @@ jobs:
             --run-ignored ignored-only
         env:
           DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+      - name: Relay authorization endpoint tests
+        # End-to-end coverage of the /api/v1/relay/* authorization endpoints
+        # (access/check, check-batch, channels, state/events): NIP-98 +
+        # trusted-service gate + relay-signed kind-19030 responses, against
+        # real Postgres and Redis (the admission gate fails closed without
+        # Redis). #[ignore]d in the default suite, selected explicitly here —
+        # see api::relay_access::tests.
+        run: |
+          cargo nextest run \
+            --archive-file target/ci/backend-integration-tests.tar.zst \
+            -E 'package(buzz-relay) and test(/api::relay_access/)' \
+            --run-ignored ignored-only
+        env:
+          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
+          REDIS_URL: redis://localhost:6379
       - name: Workspace profile (kind:9033) gate tests
         # Call-site integration for the 9033 authorization gate: open relay
         # rosterless/steward transitions and the closed-relay admin/owner rule,
