@@ -197,6 +197,54 @@ nak req -k 1059 --tag "p=<your-hex-pubkey>" \
 > `#h` matching works whether or not the signed reaction carries an `h` tag: explicit
 > `h` tags are matched directly, and tagless reactions match via their stored channel.
 
+### Canonical Publish Tags (channel + thread identity)
+
+This is the canonical wire format for channel scoping and thread identity on
+published messages, as enforced by the relay's ingest path
+(`crates/buzz-relay/src/handlers/ingest.rs`).
+
+**Channel scoping — `["h", "<channel-uuid>"]` (NIP-29 group tag):** channel
+messages (kind:9) carry the channel's UUID in an `h` tag; the ingest pipeline
+rejects channel-scoped kinds without one (`invalid: channel-scoped events must
+include an h tag`). An event without an `h` tag is not channel-scoped: kinds in
+`is_global_only_kind` (kind:1 text notes, profiles, contact lists, lists, …)
+are always stored community-global, and the remaining channel-scoped kinds
+(message edits, forum posts, NIP-29 admin events, huddle events, …) are
+rejected. Exception: kind:9007 (create-group) may omit the tag — the relay
+assigns the UUID. Channels use `h` tags (NIP-29), not `e` tags; addressable
+channel-describing events (kind:39000 metadata, kind:39001 admins, kind:39002
+members) carry the channel id in their `d` tag instead.
+
+**Thread root/reply identity — `["e", "<64-hex-event-id>", "<relay-url?>",
+"root"|"reply"]` (NIP-10):** the relay reads only the event id (position 1)
+and the marker (position 3); the relay URL position is optional. Server-side
+validation (`resolve_nip10_thread_meta`):
+
+- the referenced parent must exist and belong to the same channel
+  (unknown, cross-channel, and channel-less parents are rejected);
+- the client-claimed `root` must match the stored thread ancestry — the
+  parent's recorded root, or, when the parent has no stored thread metadata,
+  the root the parent itself declares (its own `root`/`reply` tag, or the
+  parent itself when it starts the thread);
+- depth is derived from the parent (`parent.depth + 1`, or 1/2 when the
+  parent has no metadata) and capped at 100;
+- a `reply` tag alone (no `root`) treats the parent as the root of its own
+  thread;
+- an optional `["broadcast", "1"]` tag marks a broadcast reply.
+
+Thread counters (`reply_count`/`descendant_count`) are materialized on thread
+root rows: inserting a reply increments the parent's `reply_count` and the
+root's `descendant_count` in the same transaction as the `thread_metadata`
+row (`crates/buzz-db/src/thread.rs`, `insert_thread_metadata`).
+
+**Elembra integration:** this is the canonical channel/thread wire contract
+for the Elembra Chat integration (github.com/kubedoio/rustshare), resolving
+the open thread-tag-format question that its issue #243 was blocked on. The
+HTTP-facing contract (relay authorization endpoints returning relay-signed
+kind-19030 events) is specified in
+`docs/specs/buzz-upstream-authorization-v1alpha1.md` in the rustshare
+repository.
+
 ### Tested Clients (Direct)
 
 | Client | Platform | Evidence | Notes |
