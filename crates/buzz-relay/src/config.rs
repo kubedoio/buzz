@@ -1631,11 +1631,11 @@ mod tests {
     }
 
     #[test]
-    fn relay_trusted_service_pubkeys_parse_normalize_and_preserve_order() {
+    fn relay_trusted_service_pubkeys_parse_dedupe_and_normalize() {
         let _guard = ENV_MUTEX.lock().unwrap();
         std::env::set_var(
             "RELAY_TRUSTED_SERVICE_PUBKEYS",
-            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA,bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA,bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         );
         let config = Config::from_env().expect("config");
         std::env::remove_var("RELAY_TRUSTED_SERVICE_PUBKEYS");
