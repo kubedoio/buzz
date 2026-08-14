@@ -1,4 +1,5 @@
-//! Relay authorization API — `POST /api/v1/relay/access/check`.
+//! Relay authorization API — `POST /api/v1/relay/access/check` and
+//! `POST /api/v1/relay/access/check-batch`.
 //!
 //! Lets a provisioned trusted service workload (which never holds a human
 //! user's signing key) ask the relay whether a given pubkey may currently read
@@ -16,6 +17,7 @@
 //! Existence hiding: no membership lists are ever returned and `reason`
 //! strings never reveal whether other users exist (`"not a member"`).
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::{
@@ -27,6 +29,8 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use buzz_core::kind::KIND_RELAY_AUTHZ_RESPONSE;
+use buzz_core::StoredEvent;
+use buzz_db::channel::ChannelRecord;
 use buzz_db::DbError;
 
 use crate::state::AppState;
@@ -38,6 +42,10 @@ use super::{api_error, internal_error};
 
 /// The endpoint path — the NIP-98 `u` tag must match the exact request URL.
 const ACCESS_CHECK_PATH: &str = "/api/v1/relay/access/check";
+/// The batch endpoint path — the NIP-98 `u` tag must match the exact request URL.
+const ACCESS_CHECK_BATCH_PATH: &str = "/api/v1/relay/access/check-batch";
+/// Maximum number of checks per batch request (contract: at most 64).
+const MAX_BATCH_CHECKS: usize = 64;
 
 /// A single access-check request body.
 ///
@@ -58,6 +66,86 @@ struct AccessCheckRequest {
     message_id: Option<String>,
     /// Optional unix-seconds creation time of the event being checked.
     event_created_at: Option<i64>,
+}
+
+/// A batch access-check request body.
+#[derive(Debug, Deserialize)]
+struct AccessCheckBatchRequest {
+    /// The checks to evaluate, in order; at most [`MAX_BATCH_CHECKS`].
+    checks: Vec<AccessCheckRequest>,
+}
+
+/// A validated access-check item with typed fields, ready for evaluation.
+struct ParsedCheck {
+    /// Channel UUID from the request.
+    channel_id: uuid::Uuid,
+    /// 32-byte subject pubkey.
+    subject_bytes: Vec<u8>,
+    /// Optional 32-byte message id; `None` = channel-level check.
+    message_id_bytes: Option<[u8; 32]>,
+}
+
+/// Parse and validate a single-check request body into typed fields.
+///
+/// Malformed fields (non-hex pubkey, non-UUID channel id, malformed message
+/// id) fail the whole request with 400 — shared by both endpoints.
+fn parse_check(req: &AccessCheckRequest) -> Result<ParsedCheck, (StatusCode, Json<Value>)> {
+    let subject_pubkey = nostr::PublicKey::from_hex(&req.pubkey)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid pubkey"))?;
+    let channel_id: uuid::Uuid = req
+        .channel_id
+        .parse()
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid channel_id"))?;
+    let message_id_bytes: Option<[u8; 32]> = match req.message_id.as_deref() {
+        Some(hex_str) => {
+            let decoded = hex::decode(hex_str)
+                .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid message_id"))?;
+            Some(
+                <[u8; 32]>::try_from(decoded.as_slice())
+                    .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid message_id"))?,
+            )
+        }
+        None => None,
+    };
+    Ok(ParsedCheck {
+        channel_id,
+        subject_bytes: subject_pubkey.to_bytes().to_vec(),
+        message_id_bytes,
+    })
+}
+
+/// Evaluate one access check from relay state already resolved by the caller.
+///
+/// Shared by the single and batch endpoints so their semantics cannot drift.
+/// `channel` is `None` when the channel does not exist (or is soft-deleted);
+/// `is_member` is the pre-resolved active-membership answer; `message` is the
+/// pre-resolved non-deleted event, only meaningful when `parsed` carries a
+/// message id. All lookups are community-scoped by the caller.
+fn decide(
+    channel: Option<&ChannelRecord>,
+    is_member: bool,
+    message: Option<&StoredEvent>,
+    parsed: &ParsedCheck,
+) -> (Decision, &'static str) {
+    let Some(channel) = channel else {
+        return (Decision::NotFound, "not found");
+    };
+    // Readability: an active member, or an open channel anyone may read.
+    if !is_member && channel.visibility != "open" {
+        // Existence hiding: never reveal who is or is not a member.
+        return (Decision::Deny, "not a member");
+    }
+    match parsed.message_id_bytes {
+        // Message-level availability: the message must exist, be non-deleted,
+        // and belong to the checked channel; anything else is `not_found`
+        // (never reveals the message exists elsewhere).
+        Some(_) => match message {
+            Some(se) if se.channel_id == Some(parsed.channel_id) => (Decision::Allow, "allowed"),
+            _ => (Decision::NotFound, "not found"),
+        },
+        // Channel-level check: readable is enough.
+        None => (Decision::Allow, "allowed"),
+    }
 }
 
 /// The decision outcome, serialized snake_case into the response `content`.
@@ -128,68 +216,58 @@ pub async fn check_access(
 
     let req: AccessCheckRequest = serde_json::from_slice(&body)
         .map_err(|_| api_error(StatusCode::BAD_REQUEST, "malformed request body"))?;
-
-    let subject_pubkey = nostr::PublicKey::from_hex(&req.pubkey)
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid pubkey"))?;
-    let channel_id: uuid::Uuid = req
-        .channel_id
-        .parse()
-        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid channel_id"))?;
-    let message_id_bytes: Option<[u8; 32]> = match req.message_id.as_deref() {
-        Some(hex_str) => {
-            let decoded = hex::decode(hex_str)
-                .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid message_id"))?;
-            Some(
-                <[u8; 32]>::try_from(decoded.as_slice())
-                    .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid message_id"))?,
-            )
-        }
-        None => None,
-    };
+    let parsed = parse_check(&req)?;
 
     let evaluated_at = nostr::Timestamp::now().as_secs() as i64;
 
     // Channel lookup from the relay's own state; unknown or soft-deleted
     // channels are indistinguishable (`ChannelNotFound`).
-    let channel = match state.db.get_channel(tenant.community(), channel_id).await {
-        Ok(ch) => ch,
-        Err(DbError::ChannelNotFound(_)) => {
-            return decision_response(&state, evaluated_at, Decision::NotFound, "not found", &req);
-        }
+    let channel = match state
+        .db
+        .get_channel(tenant.community(), parsed.channel_id)
+        .await
+    {
+        Ok(ch) => Some(ch),
+        Err(DbError::ChannelNotFound(_)) => None,
         Err(e) => return Err(internal_error(&format!("channel lookup failed: {e}"))),
     };
 
     // Readability: an active member, or an open channel anyone may read.
-    let subject_bytes = subject_pubkey.to_bytes();
     let is_member = state
         .db
-        .is_member(tenant.community(), channel_id, &subject_bytes)
+        .is_member(tenant.community(), parsed.channel_id, &parsed.subject_bytes)
         .await
         .map_err(|e| internal_error(&format!("membership check failed: {e}")))?;
-    if !is_member && channel.visibility != "open" {
-        // Existence hiding: never reveal who is or is not a member.
-        return decision_response(&state, evaluated_at, Decision::Deny, "not a member", &req);
-    }
 
-    // Message-level availability, when a message id was given. The message
-    // must exist, be non-deleted, and belong to the checked channel; anything
-    // else is `not_found` (never reveals the message exists elsewhere).
-    match message_id_bytes {
-        Some(id_bytes) => {
-            let stored = state
-                .db
-                .get_event_by_id(tenant.community(), &id_bytes)
-                .await
-                .map_err(|e| internal_error(&format!("event lookup failed: {e}")))?;
-            match stored {
-                Some(se) if se.channel_id == Some(channel_id) => {
-                    decision_response(&state, evaluated_at, Decision::Allow, "allowed", &req)
-                }
-                _ => decision_response(&state, evaluated_at, Decision::NotFound, "not found", &req),
-            }
-        }
-        None => decision_response(&state, evaluated_at, Decision::Allow, "allowed", &req),
-    }
+    // Message-level availability, when a message id was given.
+    let message = match parsed.message_id_bytes {
+        Some(id_bytes) => state
+            .db
+            .get_event_by_id(tenant.community(), &id_bytes)
+            .await
+            .map_err(|e| internal_error(&format!("event lookup failed: {e}")))?,
+        None => None,
+    };
+
+    let (decision, reason) = decide(channel.as_ref(), is_member, message.as_ref(), &parsed);
+    decision_response(&state, evaluated_at, decision, reason, &req)
+}
+
+/// Sign a kind-19030 authorization response event with `content` as its
+/// `content` field, using the relay's keypair.
+fn sign_response(
+    state: &AppState,
+    content: Value,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let event = nostr::EventBuilder::new(
+        nostr::Kind::Custom(KIND_RELAY_AUTHZ_RESPONSE as u16),
+        content.to_string(),
+    )
+    .sign_with_keys(&state.relay_keypair)
+    .map_err(|e| internal_error(&format!("failed to sign authorization response: {e}")))?;
+    serde_json::to_value(&event)
+        .map(Json)
+        .map_err(|e| internal_error(&format!("failed to serialize authorization response: {e}")))
 }
 
 /// Build the signed kind-19030 response event for a decision.
@@ -212,15 +290,183 @@ fn decision_response(
         "channel_id": &req.channel_id,
         "message_id": &req.message_id,
     });
-    let event = nostr::EventBuilder::new(
-        nostr::Kind::Custom(KIND_RELAY_AUTHZ_RESPONSE as u16),
-        content.to_string(),
-    )
-    .sign_with_keys(&state.relay_keypair)
-    .map_err(|e| internal_error(&format!("failed to sign authorization response: {e}")))?;
-    serde_json::to_value(&event)
-        .map(Json)
-        .map_err(|e| internal_error(&format!("failed to serialize authorization response: {e}")))
+    sign_response(state, content)
+}
+
+/// Ask whether a pubkey may currently read multiple channels/messages in one
+/// round-trip.
+///
+/// The request carries at most [`MAX_BATCH_CHECKS`] checks (more → 400); an
+/// empty `checks` list is valid and yields an empty `results` array. Each item
+/// is evaluated with the exact single-check semantics, order-preserving
+/// (`results[i]` ↔ `checks[i]`), with verbatim per-item echo of
+/// `pubkey`/`channel_id`/`message_id`. A relay-side evaluation error for one
+/// item (e.g. a channel lookup failure) yields `deny` for that item only with
+/// a generic reason — the remaining items are still evaluated. Request-level
+/// problems (malformed JSON, malformed item fields, more than
+/// [`MAX_BATCH_CHECKS`] items) fail the whole request with 400.
+///
+/// The response is a single kind-19030 event signed by the relay key; its
+/// top-level `evaluated_at` is the freshness authority for the whole batch and
+/// each item's `evaluated_at` mirrors it.
+///
+/// Auth pipeline identical to [`check_access`]: host-derived community, NIP-98
+/// pinned mandatory, trusted-service gate, admission, replay.
+pub async fn check_access_batch(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // Row zero: the community is derived from the request Host, never from
+    // client-supplied ids in the body.
+    let raw_host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let tenant = crate::tenant::bind_community(&state.db, raw_host)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "relay: no community is configured for this host",
+            )
+        })?;
+
+    // NIP-98 (kind-27235), pinned mandatory — no dev-mode X-Pubkey fallback.
+    let url = nip98_expected_url(&state.config.relay_url, &tenant, ACCESS_CHECK_BATCH_PATH);
+    let (caller_pubkey, event_id_bytes) =
+        verify_bridge_auth(&headers, "POST", &url, Some(&body), true)?;
+
+    // Trusted-service gate: only provisioned service pubkeys may call the
+    // authorization API. An empty allowlist disables it entirely (fail closed).
+    let caller_hex = caller_pubkey.to_hex();
+    if !state
+        .config
+        .relay_trusted_service_pubkeys
+        .iter()
+        .any(|trusted| trusted == &caller_hex)
+    {
+        return Err(api_error(StatusCode::UNAUTHORIZED, "untrusted caller"));
+    }
+
+    // Admission (rate limit) and NIP-98 replay protection.
+    enforce_http_admission(&state, &tenant, &caller_pubkey).await?;
+    check_nip98_replay(&state, &tenant, event_id_bytes).await?;
+
+    let batch: AccessCheckBatchRequest = serde_json::from_slice(&body)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "malformed request body"))?;
+
+    // Cap enforcement before any DB work.
+    if batch.checks.len() > MAX_BATCH_CHECKS {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            &format!("too many checks: max {MAX_BATCH_CHECKS}"),
+        ));
+    }
+
+    // Parse every item up front — a malformed item fails the whole request.
+    let mut parsed: Vec<ParsedCheck> = Vec::with_capacity(batch.checks.len());
+    let mut message_ids: Vec<[u8; 32]> = Vec::new();
+    for req in &batch.checks {
+        let item = parse_check(req)?;
+        if let Some(id) = item.message_id_bytes {
+            message_ids.push(id);
+        }
+        parsed.push(item);
+    }
+
+    let evaluated_at = nostr::Timestamp::now().as_secs() as i64;
+
+    // One membership query for every item — same per-pair semantics as the
+    // single check's `is_member` (active membership on a non-deleted channel).
+    let channel_ids: Vec<uuid::Uuid> = parsed.iter().map(|p| p.channel_id).collect();
+    let pubkeys: Vec<Vec<u8>> = parsed.iter().map(|p| p.subject_bytes.clone()).collect();
+    let membership_pairs = state
+        .db
+        .membership_pairs(tenant.community(), &channel_ids, &pubkeys)
+        .await
+        .map_err(|e| internal_error(&format!("membership batch lookup failed: {e}")))?;
+    let members: HashSet<(uuid::Uuid, Vec<u8>)> = membership_pairs.into_iter().collect();
+
+    // One message-availability query for every checked message id — non-deleted
+    // only, community-scoped.
+    let id_refs: Vec<&[u8]> = message_ids.iter().map(|m| m.as_slice()).collect();
+    let stored_events = state
+        .db
+        .get_events_by_ids(tenant.community(), &id_refs)
+        .await
+        .map_err(|e| internal_error(&format!("event batch lookup failed: {e}")))?;
+    let events_by_id: HashMap<[u8; 32], StoredEvent> = stored_events
+        .into_iter()
+        .map(|se| (se.event.id.to_bytes(), se))
+        .collect();
+
+    // Evaluate each item. Channel existence/visibility is resolved per item
+    // (no bulk channel fetch exists); membership and message availability are
+    // already resolved for the whole batch. A per-item channel lookup failure
+    // is isolated to that item (deny, generic reason).
+    let mut results: Vec<(Decision, &'static str, &AccessCheckRequest)> =
+        Vec::with_capacity(batch.checks.len());
+    for (i, (req, item)) in batch.checks.iter().zip(parsed.iter()).enumerate() {
+        let channel = match state
+            .db
+            .get_channel(tenant.community(), item.channel_id)
+            .await
+        {
+            Ok(ch) => Some(ch),
+            Err(DbError::ChannelNotFound(_)) => None,
+            Err(e) => {
+                tracing::warn!(
+                    item = i,
+                    error = %e,
+                    "batch access check: channel lookup failed for item; denying item"
+                );
+                results.push((Decision::Deny, "evaluation error", req));
+                continue;
+            }
+        };
+        let is_member = members.contains(&(item.channel_id, item.subject_bytes.clone()));
+        let message = item
+            .message_id_bytes
+            .as_ref()
+            .and_then(|id| events_by_id.get(id));
+        let (decision, reason) = decide(channel.as_ref(), is_member, message, item);
+        results.push((decision, reason, req));
+    }
+
+    batch_response(&state, evaluated_at, &results)
+}
+
+/// Build the signed kind-19030 response event for a batch of decisions.
+///
+/// One event for the whole batch; `results` is order-preserving
+/// (`results[i]` ↔ `checks[i]`), each item echoes its request's
+/// `pubkey`/`channel_id`/`message_id` verbatim, and the top-level
+/// `evaluated_at` is the freshness authority (each item's `evaluated_at`
+/// mirrors it).
+fn batch_response(
+    state: &AppState,
+    evaluated_at: i64,
+    results: &[(Decision, &'static str, &AccessCheckRequest)],
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let results_json: Vec<Value> = results
+        .iter()
+        .map(|(decision, reason, req)| {
+            serde_json::json!({
+                "decision": decision,
+                "reason": reason,
+                "evaluated_at": evaluated_at,
+                "pubkey": &req.pubkey,
+                "channel_id": &req.channel_id,
+                "message_id": &req.message_id,
+            })
+        })
+        .collect();
+    let content = serde_json::json!({
+        "results": results_json,
+        "evaluated_at": evaluated_at,
+    });
+    sign_response(state, content)
 }
 
 #[cfg(test)]
@@ -399,7 +645,19 @@ mod tests {
         fixture: &ChannelFixture,
         author: &Keys,
     ) -> Option<EventId> {
-        let event = EventBuilder::new(Kind::TextNote, "hello from relay_access test")
+        insert_message_with_content(db, fixture, author, "hello from relay_access test").await
+    }
+
+    /// [`insert_message`] with explicit content — distinct content is required
+    /// for two messages from the same author in the same second, otherwise the
+    /// deterministic Schnorr signature makes them byte-identical duplicates.
+    async fn insert_message_with_content(
+        db: &buzz_db::Db,
+        fixture: &ChannelFixture,
+        author: &Keys,
+        content: &str,
+    ) -> Option<EventId> {
+        let event = EventBuilder::new(Kind::TextNote, content)
             .sign_with_keys(author)
             .ok()?;
         db.insert_event(fixture.community, &event, Some(fixture.channel_id))
@@ -432,14 +690,36 @@ mod tests {
         keys: &Keys,
         body: Value,
     ) -> axum::response::Response {
+        post_access(ts, host, keys, body, ACCESS_CHECK_PATH).await
+    }
+
+    /// Drive one POST /api/v1/relay/access/check-batch through the router.
+    async fn post_batch(
+        ts: &TestState,
+        host: &str,
+        keys: &Keys,
+        body: Value,
+    ) -> axum::response::Response {
+        post_access(ts, host, keys, body, ACCESS_CHECK_BATCH_PATH).await
+    }
+
+    /// Drive one POST to an access endpoint, signing the NIP-98 `u` tag for
+    /// the exact `path` and `host`.
+    async fn post_access(
+        ts: &TestState,
+        host: &str,
+        keys: &Keys,
+        body: Value,
+        path: &str,
+    ) -> axum::response::Response {
         let body_str = body.to_string();
-        let url = format!("https://{host}/api/v1/relay/access/check");
+        let url = format!("https://{host}{path}");
         let auth = nip98_auth_header(keys, &url, body_str.as_bytes());
         build_router(ts.state.clone())
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/api/v1/relay/access/check")
+                    .uri(path)
                     .header(header::HOST, host)
                     .header(header::AUTHORIZATION, auth)
                     .header(header::CONTENT_TYPE, "application/json")
@@ -923,5 +1203,311 @@ mod tests {
         let content = response_content(response).await;
         assert_eq!(content["decision"], "allow");
         assert!(content["message_id"].is_null());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn batch_mixed_decisions_order_preserved_and_echoed() {
+        let host = format!("relay-batch-mixed-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        let channel = seed_channel(
+            &ts.state.db,
+            &host,
+            buzz_db::channel::ChannelVisibility::Private,
+        )
+        .await
+        .expect("channel");
+        let live_message = insert_message(&ts.state.db, &channel, &channel.member_keys)
+            .await
+            .expect("live message");
+        let deleted_message =
+            insert_message_with_content(&ts.state.db, &channel, &channel.member_keys, "deleted")
+                .await
+                .expect("message to delete");
+        ts.state
+            .db
+            .soft_delete_event(channel.community, &deleted_message.to_bytes())
+            .await
+            .expect("soft delete");
+        let member_hex = channel.member_keys.public_key().to_hex();
+        let stranger_hex = Keys::generate().public_key().to_hex();
+        let unknown_channel = Uuid::new_v4();
+
+        let items = vec![
+            check_body(&member_hex, &channel.channel_id, Some(&live_message)),
+            check_body(&stranger_hex, &channel.channel_id, Some(&live_message)),
+            check_body(&stranger_hex, &unknown_channel, None),
+            check_body(&member_hex, &channel.channel_id, Some(&deleted_message)),
+        ];
+
+        let response = post_batch(&ts, &host, &ts.service_keys, json!({ "checks": items })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content = response_content(response).await;
+        let results = content["results"].as_array().expect("results array");
+        assert_eq!(results.len(), 4, "one result per check, order preserved");
+
+        let expected: [(Value, &str, &str); 4] = [
+            (json!("allow"), "allowed", "member + live message"),
+            (json!("deny"), "not a member", "non-member"),
+            (json!("not_found"), "not found", "unknown channel"),
+            (json!("not_found"), "not found", "deleted message"),
+        ];
+        for (i, (decision, reason, label)) in expected.iter().enumerate() {
+            let result = &results[i];
+            assert_eq!(&result["decision"], decision, "item {i} ({label}) decision");
+            assert_eq!(result["reason"], *reason, "item {i} ({label}) reason");
+            // Verbatim echo of pubkey / channel_id / message_id per item.
+            assert_eq!(
+                result["pubkey"], items[i]["pubkey"],
+                "item {i} ({label}) echoes pubkey"
+            );
+            assert_eq!(
+                result["channel_id"], items[i]["channel_id"],
+                "item {i} ({label}) echoes channel_id"
+            );
+            assert_eq!(
+                result["message_id"], items[i]["message_id"],
+                "item {i} ({label}) echoes message_id"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn batch_decisions_match_single_check_decisions() {
+        let host = format!("relay-batch-parity-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        let channel = seed_channel(
+            &ts.state.db,
+            &host,
+            buzz_db::channel::ChannelVisibility::Private,
+        )
+        .await
+        .expect("channel");
+        let message = insert_message(&ts.state.db, &channel, &channel.member_keys)
+            .await
+            .expect("message");
+        let member_hex = channel.member_keys.public_key().to_hex();
+        let stranger_hex = Keys::generate().public_key().to_hex();
+        let unknown_channel = Uuid::new_v4();
+
+        let items = vec![
+            check_body(&member_hex, &channel.channel_id, Some(&message)),
+            check_body(&stranger_hex, &channel.channel_id, Some(&message)),
+            check_body(&stranger_hex, &unknown_channel, None),
+            check_body(&member_hex, &channel.channel_id, None),
+        ];
+
+        let response = post_batch(&ts, &host, &ts.service_keys, json!({ "checks": items })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let batch_content = response_content(response).await;
+        let results = batch_content["results"]
+            .as_array()
+            .expect("results array")
+            .clone();
+
+        for (i, item) in items.iter().enumerate() {
+            let single =
+                response_content(post_check(&ts, &host, &ts.service_keys, item.clone()).await)
+                    .await;
+            assert_eq!(
+                single["decision"], results[i]["decision"],
+                "item {i}: batch decision must match single-check decision"
+            );
+            assert_eq!(
+                single["reason"], results[i]["reason"],
+                "item {i}: batch reason must match single-check reason"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn batch_over_64_checks_is_bad_request() {
+        let host = format!("relay-batch-cap-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        let item = check_body(
+            &Keys::generate().public_key().to_hex(),
+            &Uuid::new_v4(),
+            None,
+        );
+        let items = vec![item; 65];
+
+        let response = post_batch(&ts, &host, &ts.service_keys, json!({ "checks": items })).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn batch_malformed_item_is_bad_request() {
+        let host = format!("relay-batch-malformed-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        // One item with a wrong field type — the whole request is malformed.
+        let items = json!([
+            {
+                "pubkey": 123,
+                "channel_id": Uuid::new_v4().to_string(),
+                "channel_kind": "workspace",
+                "message_id": null,
+            }
+        ]);
+
+        let response = post_batch(&ts, &host, &ts.service_keys, json!({ "checks": items })).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn batch_deny_item_does_not_affect_other_items() {
+        let host = format!("relay-batch-isolation-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        let channel_a = seed_channel(
+            &ts.state.db,
+            &host,
+            buzz_db::channel::ChannelVisibility::Private,
+        )
+        .await
+        .expect("channel A");
+        let channel_b = seed_channel(
+            &ts.state.db,
+            &host,
+            buzz_db::channel::ChannelVisibility::Private,
+        )
+        .await
+        .expect("channel B");
+        let message_a = insert_message(&ts.state.db, &channel_a, &channel_a.member_keys)
+            .await
+            .expect("message A");
+        let message_b = insert_message(&ts.state.db, &channel_b, &channel_b.member_keys)
+            .await
+            .expect("message B");
+        let stranger_hex = Keys::generate().public_key().to_hex();
+
+        let items = vec![
+            check_body(
+                &channel_a.member_keys.public_key().to_hex(),
+                &channel_a.channel_id,
+                Some(&message_a),
+            ),
+            check_body(&stranger_hex, &channel_a.channel_id, Some(&message_a)),
+            check_body(
+                &channel_b.member_keys.public_key().to_hex(),
+                &channel_b.channel_id,
+                Some(&message_b),
+            ),
+        ];
+
+        let response = post_batch(&ts, &host, &ts.service_keys, json!({ "checks": items })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content = response_content(response).await;
+        let results = content["results"].as_array().expect("results array");
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0]["decision"], "allow");
+        assert_eq!(results[1]["decision"], "deny");
+        assert_eq!(
+            results[2]["decision"], "allow",
+            "deny item must not affect neighbors"
+        );
+        assert_eq!(results[2]["reason"], "allowed");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn batch_untrusted_caller_is_unauthorized() {
+        let host = format!("relay-batch-trust-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        let impostor = Keys::generate();
+
+        let response = post_batch(
+            &ts,
+            &host,
+            &impostor,
+            json!({ "checks": [check_body(&Keys::generate().public_key().to_hex(), &Uuid::new_v4(), None)] }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn batch_response_is_signed_event_with_mirrored_evaluated_at() {
+        let host = format!("relay-batch-envelope-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        let channel = seed_channel(
+            &ts.state.db,
+            &host,
+            buzz_db::channel::ChannelVisibility::Private,
+        )
+        .await
+        .expect("channel");
+        let message = insert_message(&ts.state.db, &channel, &channel.member_keys)
+            .await
+            .expect("message");
+        let items = vec![
+            check_body(
+                &channel.member_keys.public_key().to_hex(),
+                &channel.channel_id,
+                Some(&message),
+            ),
+            check_body(
+                &Keys::generate().public_key().to_hex(),
+                &channel.channel_id,
+                Some(&message),
+            ),
+        ];
+
+        let response = post_batch(&ts, &host, &ts.service_keys, json!({ "checks": items })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read response body");
+        let raw = String::from_utf8(bytes.to_vec()).expect("response is UTF-8");
+        let event: nostr::Event = serde_json::from_str(&raw).expect("response is a Nostr event");
+        assert_eq!(
+            event.kind,
+            Kind::Custom(KIND_RELAY_AUTHZ_RESPONSE as u16),
+            "kind must be 19030"
+        );
+        assert_eq!(event.pubkey, ts.relay_pubkey, "signed by the relay key");
+        event.verify().expect("event id and signature must verify");
+
+        let content: Value = serde_json::from_str(&event.content).expect("content is JSON");
+        let envelope_at = content["evaluated_at"]
+            .as_i64()
+            .expect("top-level evaluated_at is unix seconds");
+        let now = nostr::Timestamp::now().as_secs() as i64;
+        assert!(
+            (now - envelope_at).abs() <= 60,
+            "evaluated_at must be recent; got {envelope_at}, now {now}"
+        );
+        let results = content["results"].as_array().expect("results array");
+        assert_eq!(results.len(), 2);
+        for (i, result) in results.iter().enumerate() {
+            assert_eq!(
+                result["evaluated_at"].as_i64(),
+                Some(envelope_at),
+                "item {i} evaluated_at must mirror the envelope value"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn batch_empty_checks_yields_empty_results() {
+        let host = format!("relay-batch-empty-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+
+        let response = post_batch(&ts, &host, &ts.service_keys, json!({ "checks": [] })).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content = response_content(response).await;
+        assert_eq!(
+            content["results"].as_array().expect("results array").len(),
+            0
+        );
+        assert!(
+            content["evaluated_at"].as_i64().is_some(),
+            "empty batch still carries the freshness authority"
+        );
     }
 }
