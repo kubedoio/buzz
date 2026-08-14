@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use buzz_core::kind::{
     event_kind_i32, is_ephemeral, is_parameterized_replaceable, KIND_AUTH, KIND_EVENT_REMINDER,
-    KIND_HUDDLE_STARTED, SHARED_GATED_KINDS,
+    KIND_HUDDLE_STARTED, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_V2, SHARED_GATED_KINDS,
 };
 use buzz_core::{CommunityId, StoredEvent};
 
@@ -1114,8 +1114,13 @@ pub struct StateEventsPage {
     pub has_more: bool,
 }
 
-/// Page the community's kind-1 channel-scoped event state — including
-/// soft-deleted rows — in `(created_at ASC, id ASC)` keyset order.
+/// Page the community's channel-scoped chat messages — the Buzz stream kinds
+/// [`KIND_STREAM_MESSAGE`] (9) and [`KIND_STREAM_MESSAGE_V2`] (40002) —
+/// including soft-deleted rows, in `(created_at ASC, id ASC)` keyset order.
+///
+/// Kind-1 text notes are global-only in Buzz (the ingest path never
+/// channel-scopes them) and are deliberately NOT part of the chat state
+/// export.
 ///
 /// `since` filters on the event's own `created_at` (inclusive). `after` is
 /// the keyset position `(created_at, id)` of the previous page's last row;
@@ -1141,7 +1146,11 @@ pub async fn query_state_events(
          WHERE e.community_id = ",
     );
     qb.push_bind(community_id.as_uuid());
-    qb.push(" AND e.kind = 1 AND c.deleted_at IS NULL");
+    qb.push(" AND e.kind IN (");
+    qb.push_bind(KIND_STREAM_MESSAGE as i32);
+    qb.push(", ");
+    qb.push_bind(KIND_STREAM_MESSAGE_V2 as i32);
+    qb.push(") AND c.deleted_at IS NULL");
     if let Some(since) = since {
         qb.push(" AND e.created_at >= ");
         qb.push_bind(since);

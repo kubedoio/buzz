@@ -1804,8 +1804,10 @@ impl Db {
         event::get_event_by_id_including_deleted(&self.pool, community_id, id_bytes).await
     }
 
-    /// Page the community's kind-1 channel-scoped event state — including
-    /// soft-deleted rows — in `(created_at ASC, id ASC)` keyset order.
+    /// Page the community's channel-scoped chat messages — the Buzz stream
+    /// kinds 9 and 40002 — including soft-deleted rows, in
+    /// `(created_at ASC, id ASC)` keyset order. Kind-1 text notes are
+    /// global-only in Buzz and are NOT part of the chat state export.
     ///
     /// `since` filters on the event's own `created_at` (inclusive); `after`
     /// is the keyset position `(created_at, id)` of the previous page's last

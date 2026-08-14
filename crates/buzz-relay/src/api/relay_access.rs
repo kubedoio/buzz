@@ -657,7 +657,13 @@ fn map_channel_kind(channel_type: &str, visibility: &str) -> &'static str {
     }
 }
 
-/// Page the community's signed kind-1 event state for reconciliation.
+/// Page the community's channel-scoped chat messages for reconciliation.
+///
+/// The page covers the Buzz stream kinds — kind 9 (`KIND_STREAM_MESSAGE`)
+/// and kind 40002 (`KIND_STREAM_MESSAGE_V2`) — which are the channel-scoped
+/// chat messages in Buzz. Kind-1 text notes are global-only in Buzz (the
+/// ingest path never channel-scopes them) and are NOT part of the chat state
+/// export.
 ///
 /// NIP-98 GET: the `u` tag covers the exact request URL INCLUDING the query
 /// string (GET carries no `payload` tag), so `since`/`limit`/`cursor` are
@@ -665,14 +671,14 @@ fn map_channel_kind(channel_type: &str, visibility: &str) -> &'static str {
 /// key whose `content` is `{ "entries": [...], "cursor": <opaque>|null,
 /// "complete": bool }`.
 ///
-/// Each entry carries the raw signed kind-1 event JSON plus a `context`
-/// field-for-field identical to Elembra's `BuzzPushContext`:
+/// Each entry carries the raw signed stream-message event JSON plus a
+/// `context` field-for-field identical to Elembra's `BuzzPushContext`:
 /// `{ community_id, channel_id, channel_kind, thread_root_id|null,
 /// message_id, event_type, supersedes_event_id|null }`. `channel_kind` is
 /// mapped from the relay's own channel state (dm → `"dm"`, private →
 /// `"private"`, else → `"workspace"`; `"excluded"` is never emitted);
 /// `event_type` is `"deleted"` for soft-deleted (tombstoned) events and
-/// `"created"` otherwise (`"edited"` is never emitted — kind-1 events are
+/// `"created"` otherwise (`"edited"` is never emitted — stream messages are
 /// immutable); `supersedes_event_id` is always null in v1alpha1.
 ///
 /// Paging is keyset-ordered by `(created_at ASC, event_id ASC)` over the
@@ -681,7 +687,7 @@ fn map_channel_kind(channel_type: &str, visibility: &str) -> &'static str {
 /// cursor is opaque base64url (no padding) of `<created_at_unix>:<event_id_hex>`; the final
 /// page reports `complete: true, cursor: null` (never `cursor: null` with
 /// `complete: false`). Only the Host-derived community's channel-scoped
-/// kind-1 events are paged; events of soft-deleted channels are excluded.
+/// stream messages are paged; events of soft-deleted channels are excluded.
 /// Untrusted callers get 401 (same trusted-service gate as the other
 /// endpoints).
 pub async fn page_state(
@@ -828,6 +834,7 @@ mod tests {
         Engine,
     };
     use buzz_auth::Nip98ReplayGuard;
+    use buzz_core::kind::KIND_STREAM_MESSAGE;
     use buzz_core::CommunityId;
     use nostr::{EventBuilder, EventId, Keys, Kind, Tag};
     use serde_json::{json, Value};
@@ -1037,17 +1044,21 @@ mod tests {
         Some(event.id)
     }
 
-    /// Insert a kind-1 text note with an explicit `created_at` into a channel.
+    /// Insert a kind-9 stream message (the Buzz channel message kind) with an
+    /// explicit `created_at` into a channel.
     async fn insert_message_at(
         db: &buzz_db::Db,
         fixture: &ChannelFixture,
         author: &Keys,
         created_at: u64,
     ) -> Option<EventId> {
-        let event = EventBuilder::new(Kind::TextNote, format!("msg-{created_at}"))
-            .custom_created_at(nostr::Timestamp::from(created_at))
-            .sign_with_keys(author)
-            .ok()?;
+        let event = EventBuilder::new(
+            Kind::Custom(KIND_STREAM_MESSAGE as u16),
+            format!("msg-{created_at}"),
+        )
+        .custom_created_at(nostr::Timestamp::from(created_at))
+        .sign_with_keys(author)
+        .ok()?;
         db.insert_event(fixture.community, &event, Some(fixture.channel_id))
             .await
             .ok()?;
@@ -1066,11 +1077,14 @@ mod tests {
         root_created_at: u64,
         created_at: u64,
     ) -> Option<EventId> {
-        let event = EventBuilder::new(Kind::TextNote, format!("reply-{created_at}"))
-            .tags([Tag::parse(["e", &parent.to_hex(), "", "reply"]).expect("e tag")])
-            .custom_created_at(nostr::Timestamp::from(created_at))
-            .sign_with_keys(author)
-            .ok()?;
+        let event = EventBuilder::new(
+            Kind::Custom(KIND_STREAM_MESSAGE as u16),
+            format!("reply-{created_at}"),
+        )
+        .tags([Tag::parse(["e", &parent.to_hex(), "", "reply"]).expect("e tag")])
+        .custom_created_at(nostr::Timestamp::from(created_at))
+        .sign_with_keys(author)
+        .ok()?;
         let meta = buzz_db::event::ThreadMetadataParams {
             event_id: event.id.as_bytes(),
             event_created_at: DateTime::from_timestamp(created_at as i64, 0).expect("ts"),
@@ -2468,7 +2482,7 @@ mod tests {
         // the deterministic signatures produce distinct ids.
         let mut events = Vec::new();
         for content in ["tie-a", "tie-b"] {
-            let event = EventBuilder::new(Kind::TextNote, content)
+            let event = EventBuilder::new(Kind::Custom(KIND_STREAM_MESSAGE as u16), content)
                 .custom_created_at(nostr::Timestamp::from(same_ts))
                 .sign_with_keys(&channel.member_keys)
                 .expect("sign");
@@ -2517,6 +2531,80 @@ mod tests {
             larger.to_hex(),
             "second page must return the remaining same-second event"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn state_kind1_global_notes_are_excluded() {
+        let host = format!("relay-state-kind1-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        let channel = seed_channel(
+            &ts.state.db,
+            &host,
+            buzz_db::channel::ChannelVisibility::Open,
+        )
+        .await
+        .expect("channel");
+        let base = nostr::Timestamp::now().as_secs() - 120;
+        // Real Buzz chat data: a channel-scoped kind-9 stream message.
+        insert_message_at(&ts.state.db, &channel, &channel.member_keys, base)
+            .await
+            .expect("stream message");
+        // Kind-1 text notes are global-only in Buzz (is_global_only_kind):
+        // a tagless one, one carrying a stray `h` tag (stored channel-less
+        // by ingest), and one raw-inserted with a channel id (impossible
+        // via ingest) — none may appear in the chat state export.
+        let tagless = EventBuilder::new(Kind::TextNote, "global note")
+            .custom_created_at(nostr::Timestamp::from(base + 1))
+            .sign_with_keys(&channel.member_keys)
+            .expect("sign");
+        ts.state
+            .db
+            .insert_event(channel.community, &tagless, None)
+            .await
+            .expect("insert tagless kind-1");
+        let with_h = EventBuilder::new(Kind::TextNote, "global note with h tag")
+            .tags([Tag::parse(["h", &channel.channel_id.to_string()]).expect("h tag")])
+            .custom_created_at(nostr::Timestamp::from(base + 2))
+            .sign_with_keys(&channel.member_keys)
+            .expect("sign");
+        ts.state
+            .db
+            .insert_event(channel.community, &with_h, None)
+            .await
+            .expect("insert kind-1 with h tag");
+        let channel_scoped_k1 = EventBuilder::new(Kind::TextNote, "kind1 in channel row")
+            .custom_created_at(nostr::Timestamp::from(base + 3))
+            .sign_with_keys(&channel.member_keys)
+            .expect("sign");
+        ts.state
+            .db
+            .insert_event(
+                channel.community,
+                &channel_scoped_k1,
+                Some(channel.channel_id),
+            )
+            .await
+            .expect("insert channel-scoped kind-1");
+
+        let response = get_state_events(&ts, &host, &ts.service_keys, "").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content = response_content(response).await;
+        let entries = content["entries"].as_array().expect("entries array");
+        assert_eq!(
+            entries.len(),
+            1,
+            "only the kind-9 stream message is paged; kind-1 notes must be excluded"
+        );
+        for entry in entries {
+            let raw_event: nostr::Event =
+                serde_json::from_value(entry["event"].clone()).expect("event parses");
+            assert_eq!(
+                raw_event.kind,
+                Kind::Custom(KIND_STREAM_MESSAGE as u16),
+                "the only entry must be the kind-9 stream message"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2887,7 +2975,11 @@ mod tests {
         assert_eq!(entries.len(), 1);
         let raw_event: nostr::Event =
             serde_json::from_value(entries[0]["event"].clone()).expect("entry event parses");
-        assert_eq!(raw_event.kind, Kind::TextNote, "entry is a kind-1 event");
+        assert_eq!(
+            raw_event.kind,
+            Kind::Custom(KIND_STREAM_MESSAGE as u16),
+            "entry is a kind-9 stream message"
+        );
         assert_eq!(
             raw_event.id, message,
             "entry event id matches the seeded event"
