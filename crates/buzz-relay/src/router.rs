@@ -110,11 +110,15 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(api::invites::accept_policy),
         )
         .route("/api/invites/claim", post(api::invites::claim_invite))
-        // Relay authorization API (NIP-98 + trusted-service gate): single
-        // access checks return relay-signed kind-19030 events.
+        // Relay authorization API (NIP-98 + trusted-service gate): single and
+        // batch access checks return relay-signed kind-19030 events.
         .route(
             "/api/v1/relay/access/check",
             post(api::relay_access::check_access),
+        )
+        .route(
+            "/api/v1/relay/access/check-batch",
+            post(api::relay_access::check_access_batch),
         )
         // Moderation queue reads (NIP-98 auth + mod-authz gate, L6)
         .route("/moderation/reports", get(api::bridge::moderation_reports))
