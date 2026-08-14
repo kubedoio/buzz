@@ -271,8 +271,23 @@ mod tests {
     /// Build an AppState for handler-level tests: fresh community on `host`,
     /// NIP-98 replay stubbed fresh, admission against a live local Redis (the
     /// admission gate fails closed without one — same constraint as the bridge
-    /// tests). Returns `None` when Postgres is unavailable.
+    /// tests). The caller's key is the trusted service. Returns `None` when
+    /// Postgres is unavailable.
     async fn access_check_test_state(host: &str) -> Option<TestState> {
+        let service_keys = Keys::generate();
+        let allowlist = vec![service_keys.public_key().to_hex()];
+        access_check_test_state_with_allowlist(host, service_keys, allowlist).await
+    }
+
+    /// Core state builder with an explicit trusted-service allowlist.
+    ///
+    /// `allowlist` is set verbatim on the config, so `vec![]` exercises the
+    /// fail-closed default (empty allowlist = the API is disabled).
+    async fn access_check_test_state_with_allowlist(
+        host: &str,
+        service_keys: Keys,
+        allowlist: Vec<String>,
+    ) -> Option<TestState> {
         let mut config = crate::config::Config::from_env().ok()?;
         let database_url = std::env::var("BUZZ_TEST_DATABASE_URL")
             .or_else(|_| std::env::var("DATABASE_URL"))
@@ -283,9 +298,7 @@ mod tests {
         config.relay_url = format!("wss://{host}");
         config.require_auth_token = true;
         config.require_relay_membership = false;
-
-        let service_keys = Keys::generate();
-        config.relay_trusted_service_pubkeys = vec![service_keys.public_key().to_hex()];
+        config.relay_trusted_service_pubkeys = allowlist;
 
         let pool = sqlx::PgPool::connect(&database_url).await.ok()?;
         let db = buzz_db::Db::from_pool(pool.clone());
@@ -605,6 +618,49 @@ mod tests {
 
     #[tokio::test]
     #[ignore = "requires Postgres"]
+    async fn message_in_other_channel_is_not_found() {
+        let host = format!("relay-access-xch-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        let channel_a = seed_channel(
+            &ts.state.db,
+            &host,
+            buzz_db::channel::ChannelVisibility::Private,
+        )
+        .await
+        .expect("channel A");
+        let channel_b = seed_channel(
+            &ts.state.db,
+            &host,
+            buzz_db::channel::ChannelVisibility::Private,
+        )
+        .await
+        .expect("channel B");
+        // The message exists only in channel B.
+        let message_b = insert_message(&ts.state.db, &channel_b, &channel_b.member_keys)
+            .await
+            .expect("message B");
+
+        // Member of channel A asks about channel A with B's message id — the
+        // message must NOT be found (and must not reveal it exists elsewhere).
+        let response = post_check(
+            &ts,
+            &host,
+            &ts.service_keys,
+            check_body(
+                &channel_a.member_keys.public_key().to_hex(),
+                &channel_a.channel_id,
+                Some(&message_b),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content = response_content(response).await;
+        assert_eq!(content["decision"], "not_found");
+        assert_eq!(content["reason"], "not found");
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
     async fn cross_community_host_is_not_found() {
         let host_a = format!("relay-access-a-{}.test", Uuid::new_v4().simple());
         let host_b = format!("relay-access-b-{}.test", Uuid::new_v4().simple());
@@ -668,6 +724,32 @@ mod tests {
                 &fixture.member_keys.public_key().to_hex(),
                 &fixture.channel_id,
                 Some(&message),
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn empty_allowlist_fails_closed() {
+        let host = format!("relay-access-empty-allow-{}.test", Uuid::new_v4().simple());
+        // The config default: no trusted service pubkeys → the authorization
+        // API is disabled and EVERY caller, even with a valid NIP-98 signature,
+        // must get 401.
+        let service_keys = Keys::generate();
+        let ts = access_check_test_state_with_allowlist(&host, service_keys, vec![])
+            .await
+            .expect("test state");
+
+        let response = post_check(
+            &ts,
+            &host,
+            &ts.service_keys,
+            check_body(
+                &Keys::generate().public_key().to_hex(),
+                &Uuid::new_v4(),
+                None,
             ),
         )
         .await;
