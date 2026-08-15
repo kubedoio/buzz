@@ -1,6 +1,7 @@
 name: Docker image
 
-# Builds and publishes the public Buzz relay images as ghcr.io/block/buzz.
+# Builds and publishes the public Buzz relay images (upstream: ghcr.io/block/buzz;
+# fork default: ghcr.io/kubedoio/buzz, see IMAGE_NAME below).
 # Normal tags contain stripped binaries; matching debug-* tags contain the same
 # optimized binaries with line-table debug information for native profilers.
 #
@@ -73,10 +74,12 @@ concurrency:
 permissions: {}
 
 env:
-  # Single source of truth for the image name. Set GHCR_IMAGE as a repo
-  # variable to override (e.g., for forks that want to push to their own
-  # namespace without forking this file).
-  IMAGE_NAME: ${{ vars.GHCR_IMAGE != '' && vars.GHCR_IMAGE || 'ghcr.io/block/buzz' }}
+  # Single source of truth for the image name. Upstream block/buzz publishes
+  # ghcr.io/block/buzz; this fork (kubedoio/buzz) publishes the supported
+  # Elembra image to its own namespace so a main-built, v1alpha1-capable
+  # image exists for production pinning. Repos may still override via the
+  # GHCR_IMAGE variable.
+  IMAGE_NAME: ${{ vars.GHCR_IMAGE != '' && vars.GHCR_IMAGE || 'ghcr.io/kubedoio/buzz' }}
 
 jobs:
   build:
@@ -310,7 +313,7 @@ jobs:
 
       - name: Attest provenance for the merged image
         # Sigstore-signed in-toto attestation, verifiable with:
-        #   gh attestation verify oci://ghcr.io/block/buzz:<tag> --owner block
+        #   gh attestation verify oci://ghcr.io/block/buzz:<tag> --owner kubedoio
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
         with:
           subject-name: ${{ env.IMAGE_NAME }}
@@ -336,12 +339,14 @@ jobs:
             echo
             echo "Verify provenance:"
             echo '```'
-            echo "gh attestation verify oci://${IMAGE_NAME}@${MERGED_DIGEST} --owner block"
+            echo "gh attestation verify oci://${IMAGE_NAME}@${MERGED_DIGEST} --owner kubedoio"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
   push-gateway-build:
     name: Build public push gateway (${{ matrix.platform }})
+    # Upstream-only artifact: the fork cannot publish the block namespace.
+    if: github.repository == 'block/buzz'
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:
@@ -419,7 +424,8 @@ jobs:
 
   push-gateway-merge:
     name: Publish public push gateway image
-    if: github.event_name != 'pull_request'
+    # Upstream-only artifact: the fork cannot publish the block namespace.
+    if: github.repository == 'block/buzz' && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     needs: push-gateway-build
     timeout-minutes: 15
