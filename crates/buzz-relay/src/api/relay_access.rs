@@ -843,6 +843,77 @@ pub async fn page_state(
     sign_response(&state, content)
 }
 
+/// Community-identity path: the zero-config bootstrap discovery contract.
+pub const COMMUNITY_PATH: &str = "/api/v1/relay/community";
+
+/// Return the community bound to the request `Host` and the relay's stable
+/// public key — the bootstrap discovery contract.
+///
+/// A trusted Elembra service calls this BEFORE creating any mapping row: the
+/// response identifies the deployment community (the row auto-seeded at
+/// startup from `RELAY_URL`) and the relay pubkey to pin. The response is a
+/// relay-signed kind-19030 event whose `content` is
+/// `{"community_id","host","relay_pubkey","evaluated_at"}`; the client MUST
+/// verify the signature against the `relay_pubkey` from the content (proves
+/// the relay controls the private key) and the `evaluated_at` freshness,
+/// exactly like every other authorization response.
+///
+/// The endpoint NEVER creates or mutates state.
+///
+/// Failures: 404 for an unmapped `Host`; 401 for missing/invalid NIP-98 or an
+/// untrusted caller; 500 when no stable relay identity is configured
+/// (`BUZZ_RELAY_PRIVATE_KEY` unset — the dev-mode deterministic key must
+/// never be handed out as a production pin) or on internal errors.
+pub async fn community_identity(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let raw_host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let tenant = crate::tenant::bind_community(&state.db, raw_host)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "relay: no community is configured for this host",
+            )
+        })?;
+
+    // NIP-98 (GET): `u` tag = exact request URL for this host, `method` = GET.
+    let url = nip98_expected_url(&state.config.relay_url, &tenant, COMMUNITY_PATH);
+    let (caller_pubkey, event_id_bytes) = verify_bridge_auth(&headers, "GET", &url, None, true)?;
+
+    // Trusted-service gate — the same fail-closed allowlist as the authz
+    // surface; an empty allowlist disables discovery entirely.
+    let caller_hex = caller_pubkey.to_hex();
+    if !state
+        .config
+        .relay_trusted_service_pubkeys
+        .iter()
+        .any(|trusted| trusted == &caller_hex)
+    {
+        return Err(api_error(StatusCode::UNAUTHORIZED, "untrusted caller"));
+    }
+
+    enforce_http_admission(&state, &tenant, &caller_pubkey).await?;
+    check_nip98_replay(&state, &tenant, event_id_bytes).await?;
+
+    // A deterministic dev key must never be persisted as a production pin.
+    if state.config.relay_private_key.is_none() {
+        return Err(internal_error("relay identity is not configured"));
+    }
+
+    let content = serde_json::json!({
+        "community_id": tenant.community().to_string(),
+        "host": tenant.host(),
+        "relay_pubkey": state.relay_keypair.public_key().to_hex(),
+        "evaluated_at": nostr::Timestamp::now().as_secs() as i64,
+    });
+    sign_response(&state, content)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
