@@ -204,6 +204,22 @@ pub struct Config {
     /// skipped — a typo must not silently disable an operator.
     pub relay_operator_pubkeys: Vec<String>,
 
+    /// Deployment-level trusted service pubkeys allowed to call the
+    /// `/api/v1/relay/*` authorization endpoints.
+    ///
+    /// Only these pubkeys may invoke the NIP-98-authenticated relay
+    /// authorization endpoints (`POST /api/v1/relay/access/check`,
+    /// `check-batch`, `GET /api/v1/relay/channels`, `GET /api/v1/relay/state/
+    /// events`) that return relay-signed kind-19030 events; every other caller
+    /// is rejected with 401. Empty (the default) disables the authorization
+    /// API entirely — fail closed.
+    ///
+    /// Set via `RELAY_TRUSTED_SERVICE_PUBKEYS` as a comma-separated list of
+    /// 64-char hex pubkeys. Invalid entries are rejected at startup (config
+    /// error), not skipped — a typo must not silently change who may call the
+    /// authorization API.
+    pub relay_trusted_service_pubkeys: Vec<String>,
+
     /// Allow NIP-OA owner attestation for relay membership.
     ///
     /// When `true` and `require_relay_membership` is also `true`, agents
@@ -688,6 +704,35 @@ impl Config {
             ));
         }
 
+        // Note: intentionally not prefixed with BUZZ_ — same relay-identity
+        // config family as RELAY_OPERATOR_PUBKEYS. Comma-separated 64-char hex
+        // pubkeys. Unlike RELAY_OWNER_PUBKEY (warn-and-ignore), an invalid
+        // entry here is a hard config error: silently dropping a trusted
+        // service pubkey would silently change who may call the authorization
+        // API.
+        let relay_trusted_service_pubkeys = match std::env::var("RELAY_TRUSTED_SERVICE_PUBKEYS") {
+            Ok(raw) => {
+                let mut pubkeys = Vec::new();
+                for entry in raw.split(',') {
+                    let entry = entry.trim().to_lowercase();
+                    if entry.is_empty() {
+                        continue;
+                    }
+                    let valid = entry.len() == 64 && entry.chars().all(|c| c.is_ascii_hexdigit());
+                    if !valid {
+                        return Err(ConfigError::InvalidValue(format!(
+                                "RELAY_TRUSTED_SERVICE_PUBKEYS entry is not a valid 64-char hex pubkey: {entry:?}"
+                            )));
+                    }
+                    if !pubkeys.contains(&entry) {
+                        pubkeys.push(entry);
+                    }
+                }
+                pubkeys
+            }
+            Err(_) => Vec::new(),
+        };
+
         let auth = buzz_auth::AuthConfig {
             rate_limits: rate_limit_config_from_env()?,
         };
@@ -1018,6 +1063,7 @@ impl Config {
             relay_owner_pubkey,
             relay_operator_api_origin,
             relay_operator_pubkeys,
+            relay_trusted_service_pubkeys,
             allow_nip_oa_auth,
             media,
             media_max_concurrent_uploads,
@@ -1573,6 +1619,46 @@ mod tests {
         assert!(matches!(
             result,
             Err(ConfigError::InvalidValue(ref msg)) if msg.contains("must be an http(s) origin")
+        ));
+    }
+
+    #[test]
+    fn relay_trusted_service_pubkeys_unset_is_empty() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("RELAY_TRUSTED_SERVICE_PUBKEYS");
+        let config = Config::from_env().expect("config");
+        assert!(config.relay_trusted_service_pubkeys.is_empty());
+    }
+
+    #[test]
+    fn relay_trusted_service_pubkeys_parse_dedupe_and_normalize() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::set_var(
+            "RELAY_TRUSTED_SERVICE_PUBKEYS",
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA,bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        );
+        let config = Config::from_env().expect("config");
+        std::env::remove_var("RELAY_TRUSTED_SERVICE_PUBKEYS");
+
+        assert_eq!(
+            config.relay_trusted_service_pubkeys,
+            vec![
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn relay_trusted_service_pubkeys_invalid_entry_is_error() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        std::env::set_var("RELAY_TRUSTED_SERVICE_PUBKEYS", "not-a-pubkey");
+        let result = Config::from_env();
+        std::env::remove_var("RELAY_TRUSTED_SERVICE_PUBKEYS");
+
+        assert!(matches!(
+            result,
+            Err(ConfigError::InvalidValue(ref msg)) if msg.contains("RELAY_TRUSTED_SERVICE_PUBKEYS")
         ));
     }
 

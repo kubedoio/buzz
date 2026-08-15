@@ -1804,6 +1804,38 @@ impl Db {
         event::get_event_by_id_including_deleted(&self.pool, community_id, id_bytes).await
     }
 
+    /// Page the community's channel-scoped chat messages — the Buzz stream
+    /// kinds 9 and 40002 — including soft-deleted rows, in
+    /// `(created_at ASC, id ASC)` keyset order. Kind-1 text notes are
+    /// global-only in Buzz and are NOT part of the chat state export.
+    ///
+    /// `since` filters on the event's own `created_at` (inclusive); `after`
+    /// is the keyset position `(created_at, id)` of the previous page's last
+    /// row; at most `limit` rows are returned with a `has_more` exhaustion
+    /// signal. Serves the relay's state-reconciliation consumers; events of
+    /// soft-deleted channels are excluded.
+    pub async fn query_state_events(
+        &self,
+        community_id: CommunityId,
+        since: Option<DateTime<Utc>>,
+        after: Option<(DateTime<Utc>, Vec<u8>)>,
+        limit: usize,
+    ) -> Result<event::StateEventsPage> {
+        event::query_state_events(&self.pool, community_id, since, after, limit).await
+    }
+
+    /// Batch-fetch thread roots for many event ids (`event_id → root_event_id`).
+    ///
+    /// Events without a `thread_metadata` row (or whose row has no root) are
+    /// absent from the map — callers default to `None`.
+    pub async fn get_thread_roots(
+        &self,
+        community_id: CommunityId,
+        event_ids: &[Vec<u8>],
+    ) -> Result<std::collections::HashMap<Vec<u8>, Vec<u8>>> {
+        thread::get_thread_roots(&self.pool, community_id, event_ids).await
+    }
+
     /// Soft-deletes an event. Returns `Ok(true)` if deleted, `Ok(false)` if already deleted.
     pub async fn soft_delete_event(
         &self,

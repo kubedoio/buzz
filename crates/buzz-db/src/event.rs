@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use buzz_core::kind::{
     event_kind_i32, is_ephemeral, is_parameterized_replaceable, KIND_AUTH, KIND_EVENT_REMINDER,
-    KIND_HUDDLE_STARTED, SHARED_GATED_KINDS,
+    KIND_HUDDLE_STARTED, KIND_STREAM_MESSAGE, KIND_STREAM_MESSAGE_V2, SHARED_GATED_KINDS,
 };
 use buzz_core::{CommunityId, StoredEvent};
 
@@ -1086,6 +1086,127 @@ pub(crate) async fn get_events_by_ids_on(
         }
     }
     Ok(out)
+}
+
+/// One row of the state-events page: the reconstructed signed event plus the
+/// tombstone marker and the channel projection needed for context building.
+#[derive(Debug, Clone)]
+pub struct StateEventRow {
+    /// Fully reconstructed signed event (id and signature preserved).
+    pub stored_event: StoredEvent,
+    /// Whether the row carries a soft-delete marker (`deleted_at` set).
+    pub is_deleted: bool,
+    /// The channel this event belongs to (never null for this page).
+    pub channel_id: Uuid,
+    /// The channel's type string (`stream|forum|dm|workflow`).
+    pub channel_type: String,
+    /// The channel's visibility string (`open|private`).
+    pub visibility: String,
+}
+
+/// A page of the community's kind-1 channel-scoped event state, including
+/// soft-deleted rows (tombstones).
+#[derive(Debug, Clone)]
+pub struct StateEventsPage {
+    /// Rows in `(created_at ASC, id ASC)` keyset order — at most `limit`.
+    pub rows: Vec<StateEventRow>,
+    /// Whether more rows exist past the last returned row (limit+1 probe).
+    pub has_more: bool,
+}
+
+/// Page the community's channel-scoped chat messages — the Buzz stream kinds
+/// [`KIND_STREAM_MESSAGE`] (9) and [`KIND_STREAM_MESSAGE_V2`] (40002) —
+/// including soft-deleted rows, in `(created_at ASC, id ASC)` keyset order.
+///
+/// Kind-1 text notes are global-only in Buzz (the ingest path never
+/// channel-scopes them) and are deliberately NOT part of the chat state
+/// export.
+///
+/// `since` filters on the event's own `created_at` (inclusive). `after` is
+/// the keyset position `(created_at, id)` of the previous page's last row;
+/// rows strictly after it are returned. At most `limit` rows are returned;
+/// `has_more` is computed with an internal `limit + 1` probe.
+///
+/// Serves the relay's state-reconciliation consumers; events of soft-deleted
+/// channels are excluded (the channel join requires `deleted_at IS NULL`).
+pub async fn query_state_events(
+    pool: &PgPool,
+    community_id: CommunityId,
+    since: Option<DateTime<Utc>>,
+    after: Option<(DateTime<Utc>, Vec<u8>)>,
+    limit: usize,
+) -> Result<StateEventsPage> {
+    let mut conn = pool.acquire().await?;
+
+    let mut qb: QueryBuilder<sqlx::Postgres> = QueryBuilder::new(
+        "SELECT e.id, e.pubkey, e.created_at, e.kind, e.tags, e.content, e.sig, \
+         e.received_at, e.channel_id, (e.deleted_at IS NOT NULL) AS is_deleted, \
+         c.channel_type::text AS channel_type, c.visibility::text AS visibility \
+         FROM events e JOIN channels c ON c.community_id = e.community_id AND c.id = e.channel_id \
+         WHERE e.community_id = ",
+    );
+    qb.push_bind(community_id.as_uuid());
+    qb.push(" AND e.kind IN (");
+    qb.push_bind(KIND_STREAM_MESSAGE as i32);
+    qb.push(", ");
+    qb.push_bind(KIND_STREAM_MESSAGE_V2 as i32);
+    qb.push(") AND c.deleted_at IS NULL");
+    if let Some(since) = since {
+        qb.push(" AND e.created_at >= ");
+        qb.push_bind(since);
+    }
+    if let Some((ts, id)) = after {
+        qb.push(" AND (e.created_at > ");
+        qb.push_bind(ts);
+        qb.push(" OR (e.created_at = ");
+        qb.push_bind(ts);
+        qb.push(" AND e.id > ");
+        qb.push_bind(id);
+        qb.push("))");
+    }
+    // The page-size bound must be self-contained: the limit+1 probe below
+    // overflows on usize::MAX. The endpoint clamps to 1..=500 before calling.
+    debug_assert!(
+        limit <= 500,
+        "state events page limit must be clamped by the caller"
+    );
+    qb.push(" ORDER BY e.created_at ASC, e.id ASC LIMIT ");
+    qb.push_bind((limit + 1) as i64);
+
+    let rows = qb.build().fetch_all(&mut *conn).await?;
+    let has_more = rows.len() > limit;
+
+    let mut out = Vec::with_capacity(rows.len().min(limit));
+    for row in rows.into_iter().take(limit) {
+        if let Some(entry) = row_to_state_event(row)? {
+            out.push(entry);
+        }
+    }
+    Ok(StateEventsPage {
+        rows: out,
+        has_more,
+    })
+}
+
+/// Reconstruct a [`StateEventRow`] from a raw state-events page row.
+///
+/// The tombstone marker and channel projection are read before the row is
+/// handed to [`row_to_stored_event`] for event reconstruction.
+fn row_to_state_event(row: sqlx::postgres::PgRow) -> Result<Option<StateEventRow>> {
+    let is_deleted: bool = row.try_get("is_deleted")?;
+    let channel_id: Uuid = row.try_get("channel_id")?;
+    let channel_type: String = row.try_get("channel_type")?;
+    let visibility: String = row.try_get("visibility")?;
+    match row_to_stored_event(row)? {
+        Some(stored_event) => Ok(Some(StateEventRow {
+            stored_event,
+            is_deleted,
+            channel_id,
+            channel_type,
+            visibility,
+        })),
+        None => Ok(None),
+    }
 }
 
 /// Parameters for [`insert_event_with_thread_metadata`].
