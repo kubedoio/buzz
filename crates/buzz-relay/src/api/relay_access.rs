@@ -41,6 +41,7 @@ use crate::state::AppState;
 
 use super::bridge::{
     check_nip98_replay, enforce_http_admission, nip98_expected_url, verify_bridge_auth,
+    verify_bridge_auth_with_options,
 };
 use super::{api_error, internal_error};
 
@@ -206,10 +207,20 @@ pub async fn check_access(
     // NIP-98 (kind-27235): `u` tag = exact request URL for this host, `method`
     // tag = POST, `payload` tag = hex SHA-256 of the body. `require_auth_token`
     // is pinned true so the bridge's dev-mode X-Pubkey fallback can never
-    // impersonate a trusted service key without a signature.
+    // impersonate a trusted service key without a signature. `require_payload`
+    // is pinned true too: the contract client always covers POST bodies with
+    // a payload hash, and a payload-less POST must not be accepted even though
+    // `verify_nip98_event` only checks the hash when the tag is present
+    // (defense-in-depth).
     let url = nip98_expected_url(&state.config.relay_url, &tenant, ACCESS_CHECK_PATH);
-    let (caller_pubkey, event_id_bytes) =
-        verify_bridge_auth(&headers, "POST", &url, Some(&body), true)?;
+    let (caller_pubkey, event_id_bytes) = verify_bridge_auth_with_options(
+        &headers,
+        "POST",
+        &url,
+        Some(&body),
+        true,
+        true, // POST bodies must be covered by a payload tag
+    )?;
 
     // Trusted-service gate: only provisioned service pubkeys may call the
     // authorization API. An empty allowlist disables it entirely (fail closed).
@@ -347,9 +358,17 @@ pub async fn check_access_batch(
         })?;
 
     // NIP-98 (kind-27235), pinned mandatory — no dev-mode X-Pubkey fallback.
+    // `require_payload` is pinned true: the contract client always covers
+    // POST bodies with a payload hash (see `check_access`).
     let url = nip98_expected_url(&state.config.relay_url, &tenant, ACCESS_CHECK_BATCH_PATH);
-    let (caller_pubkey, event_id_bytes) =
-        verify_bridge_auth(&headers, "POST", &url, Some(&body), true)?;
+    let (caller_pubkey, event_id_bytes) = verify_bridge_auth_with_options(
+        &headers,
+        "POST",
+        &url,
+        Some(&body),
+        true,
+        true, // POST bodies must be covered by a payload tag
+    )?;
 
     // Trusted-service gate: only provisioned service pubkeys may call the
     // authorization API. An empty allowlist disables it entirely (fail closed).
@@ -527,7 +546,9 @@ pub async fn list_channels(
     // NIP-98 (kind-27235), pinned mandatory — no dev-mode X-Pubkey fallback.
     // The `u` tag covers path + raw query string (same construction as the
     // moderation GETs in `bridge.rs`), so the signed `pubkey` cannot be
-    // swapped after the fact.
+    // swapped after the fact. `require_payload` stays off for GETs: NIP-98
+    // GET events carry no `payload` tag (there is no body to hash), so the
+    // strict flag would reject every legitimate request.
     let path_with_query = match raw_query {
         Some(q) if !q.is_empty() => format!("{RELAY_CHANNELS_PATH}?{q}"),
         _ => RELAY_CHANNELS_PATH.to_string(),
@@ -713,7 +734,8 @@ pub async fn page_state(
 
     // NIP-98 (kind-27235), pinned mandatory — no dev-mode X-Pubkey fallback.
     // The `u` tag covers path + raw query string, so the paging parameters
-    // cannot be swapped after the fact.
+    // cannot be swapped after the fact. `require_payload` stays off for GETs:
+    // NIP-98 GET events carry no `payload` tag (no body to hash).
     let path_with_query = match raw_query {
         Some(q) if !q.is_empty() => format!("{RELAY_STATE_EVENTS_PATH}?{q}"),
         _ => RELAY_STATE_EVENTS_PATH.to_string(),
@@ -1118,6 +1140,22 @@ mod tests {
             Tag::parse(["u", url]).expect("u tag"),
             Tag::parse(["method", "POST"]).expect("method tag"),
             Tag::parse(["payload", hex::encode(hash).as_str()]).expect("payload tag"),
+        ];
+        let event = EventBuilder::new(Kind::HttpAuth, "")
+            .tags(tags)
+            .sign_with_keys(keys)
+            .expect("sign NIP-98 event");
+        let event_json = serde_json::to_string(&event).expect("serialize NIP-98 event");
+        let encoded = BASE64.encode(event_json.as_bytes());
+        format!("Nostr {encoded}")
+    }
+
+    /// NIP-98 Authorization header for a POST WITHOUT the `payload` tag —
+    /// proves the authorization endpoints reject payload-less POSTs.
+    fn nip98_post_auth_header_no_payload(keys: &Keys, url: &str) -> String {
+        let tags = vec![
+            Tag::parse(["u", url]).expect("u tag"),
+            Tag::parse(["method", "POST"]).expect("method tag"),
         ];
         let event = EventBuilder::new(Kind::HttpAuth, "")
             .tags(tags)
@@ -1619,6 +1657,57 @@ mod tests {
                     .header(header::AUTHORIZATION, auth)
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn post_without_payload_tag_is_unauthorized() {
+        let host = format!("relay-access-nopayload-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        let single_body = check_body(
+            &Keys::generate().public_key().to_hex(),
+            &Uuid::new_v4(),
+            None,
+        )
+        .to_string();
+        let batch_body = json!({ "checks": [] }).to_string();
+
+        // access/check: a valid NIP-98 POST signature WITHOUT a payload tag
+        // must be rejected — the endpoint requires the body hash.
+        let url = format!("https://{host}/api/v1/relay/access/check");
+        let auth = nip98_post_auth_header_no_payload(&ts.service_keys, &url);
+        let response = build_router(ts.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/relay/access/check")
+                    .header(header::HOST, &host)
+                    .header(header::AUTHORIZATION, auth)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(single_body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // check-batch: same requirement.
+        let url = format!("https://{host}/api/v1/relay/access/check-batch");
+        let auth = nip98_post_auth_header_no_payload(&ts.service_keys, &url);
+        let response = build_router(ts.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/relay/access/check-batch")
+                    .header(header::HOST, &host)
+                    .header(header::AUTHORIZATION, auth)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(batch_body))
                     .expect("request"),
             )
             .await
