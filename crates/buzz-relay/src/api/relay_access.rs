@@ -844,10 +844,14 @@ pub async fn page_state(
 }
 
 /// Community-identity path: the zero-config bootstrap discovery contract.
-pub const COMMUNITY_PATH: &str = "/api/v1/relay/community";
+pub(crate) const COMMUNITY_PATH: &str = "/api/v1/relay/community";
 
 /// Return the community bound to the request `Host` and the relay's stable
 /// public key — the bootstrap discovery contract.
+///
+/// `host` is the normalized form used for the community lookup — lowercase,
+/// default port stripped, trailing dot stripped (non-default ports and IPv6
+/// brackets kept).
 ///
 /// A trusted Elembra service calls this BEFORE creating any mapping row: the
 /// response identifies the deployment community (the row auto-seeded at
@@ -897,13 +901,15 @@ pub async fn community_identity(
         return Err(api_error(StatusCode::UNAUTHORIZED, "untrusted caller"));
     }
 
-    enforce_http_admission(&state, &tenant, &caller_pubkey).await?;
-    check_nip98_replay(&state, &tenant, event_id_bytes).await?;
-
     // A deterministic dev key must never be persisted as a production pin.
+    // Checked BEFORE admission/replay: a misconfigured relay must not burn
+    // rate-limit tokens or mark the NIP-98 event id in the replay seen-set.
     if state.config.relay_private_key.is_none() {
         return Err(internal_error("relay identity is not configured"));
     }
+
+    enforce_http_admission(&state, &tenant, &caller_pubkey).await?;
+    check_nip98_replay(&state, &tenant, event_id_bytes).await?;
 
     let content = serde_json::json!({
         "community_id": tenant.community().to_string(),
@@ -1368,14 +1374,27 @@ mod tests {
         host: &str,
         keys: &Keys,
     ) -> axum::response::Response {
-        let url = format!("https://{host}{COMMUNITY_PATH}");
+        get_community_identity_with_hosts(ts, host, host, keys).await
+    }
+
+    /// [`get_community_identity`] variant that signs the NIP-98 `u` tag for
+    /// `signed_host` but sends the request with `send_host` in the Host
+    /// header — proves the URL check runs against the normalized tenant host,
+    /// not the raw header bytes.
+    async fn get_community_identity_with_hosts(
+        ts: &TestState,
+        signed_host: &str,
+        send_host: &str,
+        keys: &Keys,
+    ) -> axum::response::Response {
+        let url = format!("https://{signed_host}{COMMUNITY_PATH}");
         let auth = nip98_get_auth_header(keys, &url);
         build_router(ts.state.clone())
             .oneshot(
                 Request::builder()
                     .method("GET")
                     .uri(COMMUNITY_PATH)
-                    .header(header::HOST, host)
+                    .header(header::HOST, send_host)
                     .header(header::AUTHORIZATION, auth)
                     .body(Body::empty())
                     .expect("request"),
@@ -3266,6 +3285,94 @@ mod tests {
         let unknown_host = format!("relay-community-nomap-{}.test", Uuid::new_v4().simple());
         let response = get_community_identity(&ts, &unknown_host, &ts.service_keys).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let json = read_json(response).await;
+        assert_eq!(
+            json.get("error").and_then(Value::as_str),
+            Some("relay: no community is configured for this host"),
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn community_identity_echoes_normalized_host() {
+        let host = "relay-x.test";
+        let mut ts = access_check_test_state(host).await.expect("test state");
+        let stable_key_hex = ts.state.relay_keypair.secret_key().to_secret_hex();
+        let app_state = Arc::get_mut(&mut ts.state).expect("sole owner of AppState");
+        Arc::make_mut(&mut app_state.config).relay_private_key = Some(stable_key_hex);
+
+        // The NIP-98 `u` tag is signed for the NORMALIZED URL; the request is
+        // sent with an uppercase + default-port Host header that normalizes to
+        // the same authority.
+        let response =
+            get_community_identity_with_hosts(&ts, host, "RELAY-X.Test:443", &ts.service_keys)
+                .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content = response_content(response).await;
+        assert_eq!(
+            content["host"].as_str(),
+            Some("relay-x.test"),
+            "host must be the normalized request host, not the raw header"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn community_identity_empty_allowlist_fails_closed() {
+        let host = format!(
+            "relay-community-empty-allow-{}.test",
+            Uuid::new_v4().simple()
+        );
+        // The config default: no trusted service pubkeys → discovery is
+        // disabled and EVERY caller, even with a valid NIP-98 signature, must
+        // get 401.
+        let service_keys = Keys::generate();
+        let ts = access_check_test_state_with_allowlist(&host, service_keys, vec![])
+            .await
+            .expect("test state");
+
+        let response = get_community_identity(&ts, &host, &ts.service_keys).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn community_identity_rejects_auth_signed_for_other_host() {
+        let host = format!("relay-community-otherhost-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+
+        // Valid NIP-98 signature, but the `u` tag points at a different host
+        // than the request Host — must fail like any other auth mismatch.
+        let other_host = "attacker.example";
+        let response =
+            get_community_identity_with_hosts(&ts, other_host, &host, &ts.service_keys).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn community_identity_rejects_missing_host_header() {
+        let host = format!("relay-community-nohost-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+
+        // No Host header: no connection host to resolve → the same generic 404
+        // as any other unmapped host, before any auth is attempted.
+        let response = build_router(ts.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(COMMUNITY_PATH)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let json = read_json(response).await;
+        assert_eq!(
+            json.get("error").and_then(Value::as_str),
+            Some("relay: no community is configured for this host"),
+        );
     }
 
     #[tokio::test]

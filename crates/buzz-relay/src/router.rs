@@ -131,7 +131,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             get(api::relay_access::page_state),
         )
         .route(
-            "/api/v1/relay/community",
+            api::relay_access::COMMUNITY_PATH,
             get(api::relay_access::community_identity),
         )
         // Moderation queue reads (NIP-98 auth + mod-authz gate, L6)
