@@ -843,9 +843,86 @@ pub async fn page_state(
     sign_response(&state, content)
 }
 
+/// Community-identity path: the zero-config bootstrap discovery contract.
+pub(crate) const COMMUNITY_PATH: &str = "/api/v1/relay/community";
+
+/// Return the community bound to the request `Host` and the relay's stable
+/// public key — the bootstrap discovery contract.
+///
+/// `host` is the normalized form used for the community lookup — lowercase,
+/// default port stripped, trailing dot stripped (non-default ports and IPv6
+/// brackets kept).
+///
+/// A trusted Elembra service calls this BEFORE creating any mapping row: the
+/// response identifies the deployment community (the row auto-seeded at
+/// startup from `RELAY_URL`) and the relay pubkey to pin. The response is a
+/// relay-signed kind-19030 event whose `content` is
+/// `{"community_id","host","relay_pubkey","evaluated_at"}`; the client MUST
+/// verify the signature against the `relay_pubkey` from the content (proves
+/// the relay controls the private key) and the `evaluated_at` freshness,
+/// exactly like every other authorization response.
+///
+/// The endpoint NEVER creates or mutates state.
+///
+/// Failures: 404 for an unmapped `Host`; 401 for missing/invalid NIP-98 or an
+/// untrusted caller; 500 when no stable relay identity is configured
+/// (`BUZZ_RELAY_PRIVATE_KEY` unset — the dev-mode deterministic key must
+/// never be handed out as a production pin) or on internal errors.
+pub async fn community_identity(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let raw_host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let tenant = crate::tenant::bind_community(&state.db, raw_host)
+        .await
+        .map_err(|_| {
+            api_error(
+                StatusCode::NOT_FOUND,
+                "relay: no community is configured for this host",
+            )
+        })?;
+
+    // NIP-98 (GET): `u` tag = exact request URL for this host, `method` = GET.
+    let url = nip98_expected_url(&state.config.relay_url, &tenant, COMMUNITY_PATH);
+    let (caller_pubkey, event_id_bytes) = verify_bridge_auth(&headers, "GET", &url, None, true)?;
+
+    // Trusted-service gate — the same fail-closed allowlist as the authz
+    // surface; an empty allowlist disables discovery entirely.
+    let caller_hex = caller_pubkey.to_hex();
+    if !state
+        .config
+        .relay_trusted_service_pubkeys
+        .iter()
+        .any(|trusted| trusted == &caller_hex)
+    {
+        return Err(api_error(StatusCode::UNAUTHORIZED, "untrusted caller"));
+    }
+
+    // A deterministic dev key must never be persisted as a production pin.
+    // Checked BEFORE admission/replay: a misconfigured relay must not burn
+    // rate-limit tokens or mark the NIP-98 event id in the replay seen-set.
+    if state.config.relay_private_key.is_none() {
+        return Err(internal_error("relay identity is not configured"));
+    }
+
+    enforce_http_admission(&state, &tenant, &caller_pubkey).await?;
+    check_nip98_replay(&state, &tenant, event_id_bytes).await?;
+
+    let content = serde_json::json!({
+        "community_id": tenant.community().to_string(),
+        "host": tenant.host(),
+        "relay_pubkey": state.relay_keypair.public_key().to_hex(),
+        "evaluated_at": nostr::Timestamp::now().as_secs() as i64,
+    });
+    sign_response(&state, content)
+}
+
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use axum::{
         body::{to_bytes, Body},
@@ -1282,6 +1359,42 @@ mod tests {
                     .method("GET")
                     .uri(path)
                     .header(header::HOST, host)
+                    .header(header::AUTHORIZATION, auth)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response")
+    }
+
+    /// Drive one GET /api/v1/relay/community through the router, signing the
+    /// NIP-98 `u` tag for the exact path and `host`.
+    async fn get_community_identity(
+        ts: &TestState,
+        host: &str,
+        keys: &Keys,
+    ) -> axum::response::Response {
+        get_community_identity_with_hosts(ts, host, host, keys).await
+    }
+
+    /// [`get_community_identity`] variant that signs the NIP-98 `u` tag for
+    /// `signed_host` but sends the request with `send_host` in the Host
+    /// header — proves the URL check runs against the normalized tenant host,
+    /// not the raw header bytes.
+    async fn get_community_identity_with_hosts(
+        ts: &TestState,
+        signed_host: &str,
+        send_host: &str,
+        keys: &Keys,
+    ) -> axum::response::Response {
+        let url = format!("https://{signed_host}{COMMUNITY_PATH}");
+        let auth = nip98_get_auth_header(keys, &url);
+        build_router(ts.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(COMMUNITY_PATH)
+                    .header(header::HOST, send_host)
                     .header(header::AUTHORIZATION, auth)
                     .body(Body::empty())
                     .expect("request"),
@@ -3076,5 +3189,285 @@ mod tests {
         raw_event
             .verify()
             .expect("entry event id and signature must verify");
+    }
+
+    // --- community identity (bootstrap discovery) ---
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn community_identity_returns_signed_identity_for_bound_host() {
+        let host = format!("relay-community-ok-{}.test", Uuid::new_v4().simple());
+        let mut ts = access_check_test_state(&host).await.expect("test state");
+        // The state builder leaves the relay key unconfigured; set the stable
+        // key so the handler serves the pinned identity (mirrors production:
+        // BUZZ_RELAY_PRIVATE_KEY derives the signing keypair).
+        let stable_key_hex = ts.state.relay_keypair.secret_key().to_secret_hex();
+        let app_state = Arc::get_mut(&mut ts.state).expect("sole owner of AppState");
+        Arc::make_mut(&mut app_state.config).relay_private_key = Some(stable_key_hex);
+
+        let response = get_community_identity(&ts, &host, &ts.service_keys).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let bytes = to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("read response body");
+        let raw = String::from_utf8(bytes.to_vec()).expect("response is UTF-8");
+        let envelope: nostr::Event = serde_json::from_str(&raw).expect("response is a Nostr event");
+        assert_eq!(
+            envelope.kind,
+            Kind::Custom(KIND_RELAY_AUTHZ_RESPONSE as u16),
+            "kind must be 19030"
+        );
+        assert_eq!(envelope.pubkey, ts.relay_pubkey, "signed by the relay key");
+        envelope
+            .verify()
+            .expect("event id and signature must verify");
+
+        let content: Value = serde_json::from_str(&envelope.content).expect("content is JSON");
+        assert_eq!(
+            content["relay_pubkey"].as_str(),
+            Some(envelope.pubkey.to_hex().as_str()),
+            "the response pubkey must own the response"
+        );
+        let community = ts
+            .state
+            .db
+            .lookup_community_by_host(&host)
+            .await
+            .expect("lookup")
+            .expect("community exists");
+        assert_eq!(
+            content["community_id"].as_str(),
+            Some(community.id.to_string().as_str()),
+            "community_id must be the seeded community"
+        );
+        assert_eq!(
+            content["host"].as_str(),
+            Some(host.as_str()),
+            "host must be the normalized request host"
+        );
+        let evaluated_at = content["evaluated_at"]
+            .as_i64()
+            .expect("evaluated_at is an int");
+        let now = nostr::Timestamp::now().as_secs() as i64;
+        assert!(
+            (now - evaluated_at).abs() <= 60,
+            "evaluated_at must be within ±60s of now"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn community_identity_rejects_untrusted_caller() {
+        let host = format!("relay-community-untrusted-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+
+        let impostor = Keys::generate();
+        let response = get_community_identity(&ts, &host, &impostor).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let json = read_json(response).await;
+        assert_eq!(
+            json.get("error").and_then(Value::as_str),
+            Some("untrusted caller"),
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn community_identity_rejects_unmapped_host() {
+        let seeded_host = format!("relay-community-seeded-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&seeded_host)
+            .await
+            .expect("test state");
+
+        // A host with no communities row must fail closed (404), never fall
+        // back to the seeded community.
+        let unknown_host = format!("relay-community-nomap-{}.test", Uuid::new_v4().simple());
+        let response = get_community_identity(&ts, &unknown_host, &ts.service_keys).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let json = read_json(response).await;
+        assert_eq!(
+            json.get("error").and_then(Value::as_str),
+            Some("relay: no community is configured for this host"),
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn community_identity_echoes_normalized_host() {
+        let host = "relay-x.test";
+        let mut ts = access_check_test_state(host).await.expect("test state");
+        let stable_key_hex = ts.state.relay_keypair.secret_key().to_secret_hex();
+        let app_state = Arc::get_mut(&mut ts.state).expect("sole owner of AppState");
+        Arc::make_mut(&mut app_state.config).relay_private_key = Some(stable_key_hex);
+
+        // The NIP-98 `u` tag is signed for the NORMALIZED URL; the request is
+        // sent with an uppercase + default-port Host header that normalizes to
+        // the same authority.
+        let response =
+            get_community_identity_with_hosts(&ts, host, "RELAY-X.Test:443", &ts.service_keys)
+                .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let content = response_content(response).await;
+        assert_eq!(
+            content["host"].as_str(),
+            Some("relay-x.test"),
+            "host must be the normalized request host, not the raw header"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn community_identity_empty_allowlist_fails_closed() {
+        let host = format!(
+            "relay-community-empty-allow-{}.test",
+            Uuid::new_v4().simple()
+        );
+        // The config default: no trusted service pubkeys → discovery is
+        // disabled and EVERY caller, even with a valid NIP-98 signature, must
+        // get 401.
+        let service_keys = Keys::generate();
+        let ts = access_check_test_state_with_allowlist(&host, service_keys, vec![])
+            .await
+            .expect("test state");
+
+        let response = get_community_identity(&ts, &host, &ts.service_keys).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn community_identity_rejects_auth_signed_for_other_host() {
+        let host = format!("relay-community-otherhost-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+
+        // Valid NIP-98 signature, but the `u` tag points at a different host
+        // than the request Host — must fail like any other auth mismatch.
+        let other_host = "attacker.example";
+        let response =
+            get_community_identity_with_hosts(&ts, other_host, &host, &ts.service_keys).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn community_identity_rejects_missing_host_header() {
+        let host = format!("relay-community-nohost-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+
+        // No Host header: no connection host to resolve → the same generic 404
+        // as any other unmapped host, before any auth is attempted.
+        let response = build_router(ts.state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(COMMUNITY_PATH)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let json = read_json(response).await;
+        assert_eq!(
+            json.get("error").and_then(Value::as_str),
+            Some("relay: no community is configured for this host"),
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn community_identity_fails_closed_without_stable_relay_key() {
+        let host = format!("relay-community-nokey-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        // The state builder leaves relay_private_key unset — the fail-closed
+        // path: no stable identity may ever be handed out as a pin.
+
+        let response = get_community_identity(&ts, &host, &ts.service_keys).await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// NIP-98 replay guard that returns `Ok(true)` the first time a given
+    /// event id is seen and `Ok(false)` on every subsequent call — mirrors
+    /// what the Redis guard does after a `SET NX` succeeds and then fails.
+    struct SeenOnceReplayGuard {
+        seen: Mutex<std::collections::HashSet<[u8; 32]>>,
+    }
+
+    impl SeenOnceReplayGuard {
+        fn new() -> Self {
+            Self {
+                seen: Mutex::new(std::collections::HashSet::new()),
+            }
+        }
+    }
+
+    impl buzz_auth::Nip98ReplayGuard for SeenOnceReplayGuard {
+        fn try_mark_in_scope<'a>(
+            &'a self,
+            _scope: &'a str,
+            event_id: &'a nostr::EventId,
+            _ttl_secs: u64,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<bool, buzz_auth::AuthError>> + Send + 'a>,
+        > {
+            let bytes = *event_id.as_bytes();
+            let inserted = self.seen.lock().expect("replay set").insert(bytes);
+            Box::pin(async move { Ok(inserted) })
+        }
+    }
+
+    /// Endpoint-level proof that a replayed NIP-98 auth event on the
+    /// community-identity GET is rejected — the first call succeeds, but
+    /// reusing the exact same Authorization header (same signed NIP-98 event
+    /// id) is rejected as replay.
+    #[tokio::test]
+    #[ignore = "requires Postgres"]
+    async fn community_identity_rejects_replayed_auth_event() {
+        let host = format!("relay-community-replay-{}.test", Uuid::new_v4().simple());
+        let ts = access_check_test_state(&host).await.expect("test state");
+        // Swap the always-fresh guard for one that fires the second time the
+        // same event id is presented — the code path we're pinning.
+        let mut state_owned =
+            Arc::try_unwrap(ts.state).unwrap_or_else(|_| panic!("sole owner of AppState"));
+        state_owned.nip98_replay = Arc::new(SeenOnceReplayGuard::new());
+        Arc::make_mut(&mut state_owned.config).relay_private_key =
+            Some(state_owned.relay_keypair.secret_key().to_secret_hex());
+        let state = Arc::new(state_owned);
+
+        // Build one NIP-98 header and reuse it verbatim on two GETs.
+        let url = format!("https://{host}{COMMUNITY_PATH}");
+        let auth = nip98_get_auth_header(&ts.service_keys, &url);
+
+        let send = |auth: String| {
+            let state = state.clone();
+            let host = host.clone();
+            async move {
+                build_router(state)
+                    .oneshot(
+                        Request::builder()
+                            .method("GET")
+                            .uri(COMMUNITY_PATH)
+                            .header(header::HOST, host.as_str())
+                            .header(header::AUTHORIZATION, auth)
+                            .body(Body::empty())
+                            .expect("request"),
+                    )
+                    .await
+                    .expect("response")
+            }
+        };
+
+        let first = send(auth.clone()).await;
+        assert_eq!(first.status(), StatusCode::OK);
+
+        // Same signed auth event, sent again → replay guard fires.
+        let second = send(auth).await;
+        assert_eq!(second.status(), StatusCode::UNAUTHORIZED);
+        let json = read_json(second).await;
+        assert_eq!(
+            json.get("error").and_then(Value::as_str),
+            Some("NIP-98: replay detected"),
+        );
     }
 }
