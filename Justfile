@@ -460,7 +460,7 @@ dev *ARGS: bootstrap _ensure-sidecar-stubs _ensure-migrations
     if [[ -n "{{mesh}}" ]]; then
         export MESH_LLM_NATIVE_RUNTIME_CACHE_DIR="$(./scripts/ensure-mesh-native-runtime.sh)"
     fi
-    # Docker Desktop's forwarded MinIO port can stall under the deployment
+    # Docker Desktop's forwarded RustFS port can stall under the deployment
     # probe's 32 concurrent writers. Keep the gate enabled in local dev, using
     # the bounded profile already used by the relay test launcher.
     export BUZZ_GIT_PROBE_WRITERS="${BUZZ_GIT_PROBE_WRITERS:-8}"

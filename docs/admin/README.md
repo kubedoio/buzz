@@ -33,7 +33,7 @@ Report reads accept optional `communityId`, `status`, `reportType`, `targetKind`
 a bounded newest-first summary from the existing product-feedback repository.
 
 For local review, run `just admin-seed` before `just admin`. The seed command
-also uploads real image and diagnostic fixtures to local MinIO. Feedback search
+also uploads real image and diagnostic fixtures to local RustFS. Feedback search
 and filters run over the bounded browser result set; the **Acted on** checkbox is
 stored in that browser's local storage.
 

@@ -645,7 +645,7 @@ pub struct AppState {
 
     /// Bounded channel for audit logging, absent when audit logging is disabled.
     pub audit_tx: Option<mpsc::Sender<buzz_audit::NewAuditEntry>>,
-    /// Media storage client (S3/MinIO).
+    /// Media storage client (S3-compatible).
     pub media_storage: Arc<MediaStorage>,
     /// Single-flight + cache state for the hourly S3 storage sweep. See
     /// `storage_sweep` module docs; shared with the usage-metrics tick via

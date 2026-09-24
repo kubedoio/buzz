@@ -234,7 +234,7 @@ pub struct Config {
     /// Default: `false`. Set via `BUZZ_ALLOW_NIP_OA_AUTH=true`.
     pub allow_nip_oa_auth: bool,
 
-    /// Media storage configuration (S3/MinIO).
+    /// Media storage configuration (S3-compatible).
     pub media: buzz_media::MediaConfig,
     /// Maximum concurrent media uploads handled by one relay process.
     pub media_max_concurrent_uploads: usize,
