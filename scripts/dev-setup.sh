@@ -71,7 +71,7 @@ load_env() {
 
 cleanup_legacy_sprout_containers() {
   local legacy_containers
-  legacy_containers=$(docker ps -a --format '{{.Names}}' | grep -E '^sprout-(postgres|redis|adminer|keycloak|minio|minio-init|prometheus)$' || true)
+  legacy_containers=$(docker ps -a --format '{{.Names}}' | grep -E '^sprout-(postgres|redis|adminer|keycloak|rustfs|rustfs-init|prometheus)$' || true)
   if [[ -z "${legacy_containers}" ]]; then
     return
   fi
