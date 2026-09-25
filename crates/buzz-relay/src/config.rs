@@ -1622,6 +1622,7 @@ mod tests {
         ));
     }
 
+    #[test]
     fn relay_trusted_service_pubkeys_unset_is_empty() {
         let _guard = ENV_MUTEX.lock().unwrap();
         std::env::remove_var("RELAY_TRUSTED_SERVICE_PUBKEYS");
