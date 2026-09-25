@@ -81,10 +81,10 @@ not the Elembra compatibility path.
 
 ## Candidate artifact
 
-The reviewed fork head is `e58dc46b59f40ad635677008cf7b7f43eafa4085` and the
+The reviewed fork head is `853cc331a80b4fb6551ad895f2d9039d8f903758` and the
 immutable candidate is
-`ghcr.io/kubedoio/buzz@sha256:729ba4b4ed3fc52bd7c2017820fd97ded77fbc712e91a1088107357ab8dcaf63`
-(tag `0.2.1-elembra.3`). Native image release workflow `36160497418` passed
+`ghcr.io/kubedoio/buzz@sha256:ed82b0a0f0351bb33018e50b7d472fe8d92f6a50e8dfb8e8ebd2f8a04b763742`
+(tag `0.2.1-elembra.4`). Native image release workflow `36164497937` passed
 for the published architectures and emitted provenance. Root and harness
 Compose use the same pinned RustFS runtime/client images; no MinIO image is
 required by the supported relay test/development path.
