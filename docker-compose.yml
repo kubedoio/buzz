@@ -100,51 +100,52 @@ services:
       com.buzz.env: "dev"
     restart: unless-stopped
 
-  minio:
-    image: minio/minio:latest
-    container_name: buzz-minio
-    command: server /data --console-address ":9001"
+  rustfs:
+    image: rustfs/rustfs@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff
+    container_name: buzz-rustfs
     environment:
-      MINIO_ROOT_USER: buzz_dev
-      MINIO_ROOT_PASSWORD: buzz_dev_secret
+      RUSTFS_ROOT_USER: buzz_dev
+      RUSTFS_ROOT_PASSWORD: buzz_dev_secret
+      RUSTFS_DATA_DIR: /data
+      RUSTFS_LOGS_DIR: /logs
     ports:
       - "127.0.0.1:9000:9000"
       - "127.0.0.1:9001:9001"
     volumes:
-      - minio-data:/data
+      - rustfs-data:/data
+      - rustfs-logs:/logs
     networks:
       - buzz-net
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 5s
+      test: ["CMD", "sh", "-c", "nc -z localhost 9000 && nc -z localhost 9001"]
+      interval: 10s
       timeout: 5s
-      retries: 10
+      retries: 5
       start_period: 10s
     deploy:
       resources:
         limits:
           memory: 256m
     labels:
-      com.buzz.service: "minio"
+      com.buzz.service: "rustfs"
       com.buzz.env: "dev"
     restart: unless-stopped
 
-  minio-init:
-    image: minio/mc:latest
-    container_name: buzz-minio-init
+  rustfs-init:
+    image: rustfs/rc@sha256:ab024bfebee49a750ce886b4c70963ccd9ddaa03f491704a90710641d7a26699
+    container_name: buzz-rustfs-init
     depends_on:
-      minio:
+      rustfs:
         condition: service_healthy
     networks:
       - buzz-net
     entrypoint: >
       /bin/sh -c "
-        mc alias set local http://minio:9000 buzz_dev buzz_dev_secret &&
-        mc mb --ignore-existing local/buzz-media &&
-        mc anonymous set none local/buzz-media
+        rc alias set local http://rustfs:9000 buzz_dev buzz_dev_secret &&
+        rc bucket create local/buzz-media --ignore-existing --quiet
       "
     labels:
-      com.buzz.service: "minio-init"
+      com.buzz.service: "rustfs-init"
       com.buzz.env: "dev"
     restart: "no"
 
@@ -174,10 +175,14 @@ volumes:
     name: buzz-postgres-data
     labels:
       com.buzz.volume: "postgres"
-  minio-data:
-    name: buzz-minio-data
+  rustfs-data:
+    name: buzz-rustfs-data
     labels:
-      com.buzz.volume: "minio"
+      com.buzz.volume: "rustfs"
+  rustfs-logs:
+    name: buzz-rustfs-logs
+    labels:
+      com.buzz.volume: "rustfs-logs"
   prometheus-data:
     name: buzz-prometheus-data
     labels:

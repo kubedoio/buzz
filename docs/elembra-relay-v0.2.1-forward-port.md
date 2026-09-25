@@ -78,3 +78,13 @@ thread metadata, so those implementations were reused rather than forked.
 The RustShare supported deployment remains the owner of the pinned dedicated
 Buzz RustFS Compose configuration. The upstream development Compose file is
 not the Elembra compatibility path.
+
+## Candidate artifact
+
+The reviewed fork head is `e58dc46b59f40ad635677008cf7b7f43eafa4085` and the
+immutable candidate is
+`ghcr.io/kubedoio/buzz@sha256:729ba4b4ed3fc52bd7c2017820fd97ded77fbc712e91a1088107357ab8dcaf63`
+(tag `0.2.1-elembra.3`). Native image release workflow `36160497418` passed
+for the published architectures and emitted provenance. Root and harness
+Compose use the same pinned RustFS runtime/client images; no MinIO image is
+required by the supported relay test/development path.
