@@ -36,3 +36,45 @@ of the Elembra compatibility delta.
 
 The adapter will not read Elembra data, add an Elembra ACL, or alter the
 upstream authority model. All negative decisions remain fail closed.
+
+## Final maintained delta
+
+The maintained fork delta is limited to:
+
+1. the trusted service-workload allowlist;
+2. the v1alpha1 single and batch access endpoints;
+3. the signed authoritative channel registry;
+4. the signed channel-scoped state/event page with tombstones;
+5. signed community identity discovery;
+6. the Elembra response kind (`19030`), configuration, tests, and fork image
+   publishing/provenance wiring.
+
+The release already supplies NIP-98 verification, replay protection, relay
+signing, tenant binding, membership/admission, channel/message semantics, and
+thread metadata, so those implementations were reused rather than forked.
+
+## Validation evidence
+
+- `cargo check -p buzz-relay`: PASS.
+- `cargo clippy -p buzz-relay --all-targets --all-features -- -D warnings`:
+  PASS.
+- The ignored `api::relay_access::tests` suite: **48 passed, 0 failed** against
+  Postgres and Redis.
+- The full `buzz-relay` library suite: **869 passed, 1 failed, 88 ignored**.
+  The single failure is the upstream `api::mesh_demo::tests::demo_join_forwarded_arm_round_trips_echo`
+  504/200 assertion; it reproduces unchanged on pristine `relay-v0.2.1` and is
+  outside the Elembra delta.
+- A copy of an old-image database at migration 28, containing two channels,
+  memberships including one revoked member, sixteen events, and one tombstone,
+  started with the candidate and `BUZZ_AUTO_MIGRATE=true`. The community ID,
+  channel IDs, event count, tombstone, revoked membership, and migration level
+  were unchanged. Dedicated RustFS was copied to a separate bucket and the
+  candidate's object-store startup probe passed.
+- The old supported image restarted successfully against that candidate-updated
+  copy. Rollback classification is therefore **A** for the current migration-28
+  schema; any future schema-changing release must repeat this proof and may
+  require a database/storage snapshot restore.
+
+The RustShare supported deployment remains the owner of the pinned dedicated
+Buzz RustFS Compose configuration. The upstream development Compose file is
+not the Elembra compatibility path.
