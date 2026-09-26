@@ -80,6 +80,7 @@ env:
   # image exists for production pinning. Repos may still override via the
   # GHCR_IMAGE variable.
   IMAGE_NAME: ${{ vars.GHCR_IMAGE != '' && vars.GHCR_IMAGE || 'ghcr.io/kubedoio/buzz' }}
+  ELEMBRA_IMAGE_NAME: ghcr.io/kubedoio/buzz-elembra
 
 jobs:
   build:
@@ -184,6 +185,39 @@ jobs:
           cache-to: |
             ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && format('type=registry,ref={0}-buildcache:{1},mode=max,compression=zstd', env.IMAGE_NAME, matrix.arch) || '' }}
 
+      - name: Build and push Elembra Chat image by digest
+        id: build-elembra
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime-elembra
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.ELEMBRA_IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          cache-from: type=registry,ref=${{ env.ELEMBRA_IMAGE_NAME }}-buildcache:${{ matrix.arch }}
+          cache-to: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && format('type=registry,ref={0}-buildcache:{1},mode=max,compression=zstd', env.ELEMBRA_IMAGE_NAME, matrix.arch) || '' }}
+
+      - name: Scan exact Elembra Chat image before publication
+        if: github.event_name != 'pull_request'
+        shell: bash
+        env:
+          TRIVY_IMAGE: aquasec/trivy@sha256:e2b22eac59c02003d8749f5b8d9bd073b62e30fefaef5b7c8371204e0a4b0c08
+          ELEMBRA_DIGEST: ${{ steps.build-elembra.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/trivy-cache
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v /tmp/trivy-cache:/root/.cache/trivy \
+            "${TRIVY_IMAGE}" image \
+            --platform "${{ matrix.platform }}" \
+            --scanners vuln \
+            --severity CRITICAL,HIGH \
+            --ignore-unfixed=false \
+            --exit-code 1 \
+            "${ELEMBRA_IMAGE_NAME}@${ELEMBRA_DIGEST}"
+
       - name: Build and push debug image by digest
         id: build-debug
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf  # v7.2.0
@@ -202,10 +236,14 @@ jobs:
         env:
           RELEASE_DIGEST: ${{ steps.build-release.outputs.digest }}
           DEBUG_DIGEST: ${{ steps.build-debug.outputs.digest }}
+          ELEMBRA_DIGEST: ${{ steps.build-elembra.outputs.digest }}
         run: |
           mkdir -p /tmp/digests-release /tmp/digests-debug
           touch "/tmp/digests-release/${RELEASE_DIGEST#sha256:}"
           touch "/tmp/digests-debug/${DEBUG_DIGEST#sha256:}"
+
+          mkdir -p /tmp/digests-elembra
+          touch "/tmp/digests-elembra/${ELEMBRA_DIGEST#sha256:}"
 
       - name: Upload release digest
         if: github.event_name != 'pull_request'
@@ -225,12 +263,23 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+      - name: Upload Elembra digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: digests-elembra-${{ matrix.arch }}
+          path: /tmp/digests-elembra/*
+          if-no-files-found: error
+          retention-days: 1
+
   merge:
     name: Merge ${{ matrix.variant }} multi-arch manifest
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     needs: build
     timeout-minutes: 15
+    env:
+      TARGET_IMAGE: ${{ matrix.image_name }}
     permissions:
       contents: read
       packages: write    # push the merged manifest
@@ -242,8 +291,13 @@ jobs:
         include:
           - variant: release
             tag_prefix: ""
+            image_name: ghcr.io/kubedoio/buzz
           - variant: debug
             tag_prefix: debug-
+            image_name: ghcr.io/kubedoio/buzz
+          - variant: elembra
+            tag_prefix: ""
+            image_name: ghcr.io/kubedoio/buzz-elembra
 
     steps:
       - name: Download all per-arch digests
@@ -267,7 +321,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@80c7e94dd9b9319bd5eb7a0e0fe9291e23a2a2e9  # v6.1.0
         with:
-          images: ${{ env.IMAGE_NAME }}
+          images: ${{ env.TARGET_IMAGE }}
           # Must mirror the build job's tag matrix exactly — the merge job
           # re-derives tags to stamp them onto the multi-arch manifest. See
           # the build job's `meta` step for why match=^relay-v(.*)$, why
@@ -287,7 +341,7 @@ jobs:
         id: manifest
         working-directory: /tmp/digests
         env:
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          IMAGE_NAME: ${{ env.TARGET_IMAGE }}
           META_TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           set -euo pipefail
@@ -316,13 +370,13 @@ jobs:
         #   gh attestation verify oci://${IMAGE_NAME}:<tag> --owner kubedoio
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373  # v4.1.1
         with:
-          subject-name: ${{ env.IMAGE_NAME }}
+          subject-name: ${{ env.TARGET_IMAGE }}
           subject-digest: ${{ steps.manifest.outputs.digest }}
           push-to-registry: true
 
       - name: Summary
         env:
-          IMAGE_NAME: ${{ env.IMAGE_NAME }}
+          IMAGE_NAME: ${{ env.TARGET_IMAGE }}
           VARIANT: ${{ matrix.variant }}
           MERGED_DIGEST: ${{ steps.manifest.outputs.digest }}
           META_TAGS: ${{ steps.meta.outputs.tags }}
