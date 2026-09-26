@@ -176,3 +176,22 @@ FROM runtime-base AS runtime
 COPY --from=stripped-binaries /build/target/release/buzz-relay /usr/local/bin/buzz-relay
 COPY --from=stripped-binaries /build/target/release/buzz-admin /usr/local/bin/buzz-admin
 COPY --from=stripped-binaries /build/target/release/buzz-pair-relay /usr/local/bin/buzz-pair-relay
+
+# Elembra Chat profile. This is deliberately a separate image target: the
+# generic runtime above remains Git-capable and keeps its existing contract,
+# while the supported Elembra profile ships only the relay binary on a pinned
+# distroless base. BUZZ_GIT_ENABLED is also enforced by the application so
+# routes and the startup Git probe are absent, not merely unreachable.
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:54df941ed0d06a1bd95ef5e0ce391fd8d9f94b64782dc9a60062727849ee3f97 AS runtime-elembra
+LABEL org.opencontainers.image.title="Buzz Elembra Chat Relay" \
+      org.opencontainers.image.description="Chat-focused Buzz relay runtime for Elembra" \
+      org.opencontainers.image.source="https://github.com/kubedoio/buzz" \
+      org.opencontainers.image.url="https://github.com/kubedoio/buzz" \
+      org.opencontainers.image.licenses="Apache-2.0"
+
+ENV BUZZ_GIT_ENABLED=false
+COPY --from=stripped-binaries /build/target/release/buzz-relay /usr/local/bin/buzz-relay
+USER nonroot:nonroot
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=5 \
+    CMD ["/usr/local/bin/buzz-relay", "--healthcheck"]
+ENTRYPOINT ["/usr/local/bin/buzz-relay"]

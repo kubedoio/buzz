@@ -64,7 +64,7 @@ struct CacheState {
 
 /// Process-local, byte-bounded cache of immutable pack/index pairs.
 pub struct GitPackCache {
-    _session_dir: tempfile::TempDir,
+    _session_dir: Option<tempfile::TempDir>,
     heartbeat_task: Option<tokio::task::JoinHandle<()>>,
     root: PathBuf,
     max_bytes: u64,
@@ -103,6 +103,22 @@ impl Drop for FlightParticipant<'_> {
 }
 
 impl GitPackCache {
+    /// Construct the inert cache used by profiles that do not expose Git.
+    ///
+    /// Keeping the state shape stable avoids a second authorization/runtime
+    /// path; no directory or background task is created in this mode.
+    pub fn disabled() -> Self {
+        Self {
+            _session_dir: None,
+            heartbeat_task: None,
+            root: PathBuf::new(),
+            max_bytes: 0,
+            population_semaphore: tokio::sync::Semaphore::new(1),
+            state: Mutex::new(CacheState::default()),
+            flights: DashMap::new(),
+        }
+    }
+
     /// Create an isolated process-lifetime cache beneath `cache_parent`.
     pub fn new(
         cache_parent: &Path,
@@ -145,7 +161,7 @@ impl GitPackCache {
             })
         });
         let cache = Self {
-            _session_dir: session_dir,
+            _session_dir: Some(session_dir),
             heartbeat_task,
             root,
             max_bytes,
@@ -511,6 +527,14 @@ fn cleanup_sessions_older_than(cache_parent: &Path, max_age: Duration) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn disabled_cache_creates_no_session_or_heartbeat() {
+        let cache = GitPackCache::disabled();
+        assert!(cache.root.as_os_str().is_empty());
+        assert!(cache.heartbeat_task.is_none());
+        assert!(cache._session_dir.is_none());
+    }
 
     fn digest(character: char) -> String {
         std::iter::repeat_n(character, 64).collect()

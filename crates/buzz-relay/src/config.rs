@@ -255,6 +255,13 @@ pub struct Config {
     /// 60 seconds after the last message.
     pub ephemeral_ttl_override: Option<i32>,
 
+    /// Whether Git Smart HTTP and Git policy routes are enabled.
+    ///
+    /// Defaults to true to preserve the generic Buzz runtime contract. The
+    /// Elembra Chat profile disables this capability explicitly so its image
+    /// does not need the Git executable or Git scratch storage.
+    pub git_enabled: bool,
+
     /// Root directory for the relay's local git scratch. No authoritative
     /// repository state lives here — runtime reads/writes hydrate ephemeral
     /// repos from object storage per request. Temporary workspaces, buffered
@@ -862,16 +869,24 @@ impl Config {
             );
         }
 
-        // Git server config
-        let git_repo_path = ensure_git_repo_path(
-            std::env::var("BUZZ_GIT_REPO_PATH").unwrap_or_else(|_| "./repos".to_string()),
-        )?;
-        let git_pack_cache_path = ensure_git_path(
-            "BUZZ_GIT_PACK_CACHE_PATH",
-            std::env::var("BUZZ_GIT_PACK_CACHE_PATH")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(|_| git_repo_path.join(".pack-cache")),
-        )?;
+        // Git server config. Disabled profiles deliberately avoid creating
+        // repository or cache directories; the state object uses a no-op cache
+        // in that mode and no Git handler can reach these paths.
+        let git_enabled = parse_bool("BUZZ_GIT_ENABLED", true)?;
+        let (git_repo_path, git_pack_cache_path) = if git_enabled {
+            let git_repo_path = ensure_git_repo_path(
+                std::env::var("BUZZ_GIT_REPO_PATH").unwrap_or_else(|_| "./repos".to_string()),
+            )?;
+            let git_pack_cache_path = ensure_git_path(
+                "BUZZ_GIT_PACK_CACHE_PATH",
+                std::env::var("BUZZ_GIT_PACK_CACHE_PATH")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| git_repo_path.join(".pack-cache")),
+            )?;
+            (git_repo_path, git_pack_cache_path)
+        } else {
+            (std::path::PathBuf::new(), std::path::PathBuf::new())
+        };
         let git_max_pack_bytes: u64 = std::env::var("BUZZ_GIT_MAX_PACK_BYTES")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -1071,6 +1086,7 @@ impl Config {
             media_uploads_per_minute,
             audit_enabled,
             ephemeral_ttl_override,
+            git_enabled,
             git_repo_path,
             git_pack_cache_path,
             git_max_pack_bytes,
@@ -1504,6 +1520,21 @@ mod tests {
             Err(ConfigError::InvalidValue(ref message))
                 if message.contains("BUZZ_AUDIT_ENABLED")
         ));
+    }
+
+    #[test]
+    fn git_capability_defaults_on_and_accepts_explicit_off() {
+        let _guard = ENV_MUTEX.lock().unwrap();
+        let previous = std::env::var_os("BUZZ_GIT_ENABLED");
+        std::env::remove_var("BUZZ_GIT_ENABLED");
+        assert!(parse_bool("BUZZ_GIT_ENABLED", true).unwrap());
+        std::env::set_var("BUZZ_GIT_ENABLED", "false");
+        assert!(!parse_bool("BUZZ_GIT_ENABLED", true).unwrap());
+        if let Some(value) = previous {
+            std::env::set_var("BUZZ_GIT_ENABLED", value);
+        } else {
+            std::env::remove_var("BUZZ_GIT_ENABLED");
+        }
     }
 
     #[test]

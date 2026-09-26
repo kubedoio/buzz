@@ -792,14 +792,16 @@ impl AppState {
             config.media.s3_addressing_style,
         )
         .expect("media storage was already constructed with this S3 config");
-        let git_pack_cache = Arc::new(
+        let git_pack_cache = Arc::new(if config.git_enabled {
             crate::api::git::pack_cache::GitPackCache::new(
                 &config.git_pack_cache_path,
                 config.git_pack_cache_max_bytes,
                 config.git_pack_cache_max_concurrent_populations,
             )
-            .expect("git pack cache path must be available"),
-        );
+            .expect("git pack cache path must be available")
+        } else {
+            crate::api::git::pack_cache::GitPackCache::disabled()
+        });
         let nip98_replay: Arc<dyn Nip98ReplayGuard> =
             Arc::new(RedisNip98ReplayGuard::new(redis_pool.clone()));
         let admission_rate_limiter = Arc::new(RedisRateLimiter::new(redis_pool.clone()));

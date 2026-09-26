@@ -46,10 +46,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(RequestBodyLimitLayer::new(media_body_limit))
         .with_state(state.clone());
 
-    let git_router = api::git::git_router(state.clone());
-
-    let git_policy_router = api::git::git_policy_router(state.clone());
-
     let admin_enabled = state.config.admin.is_some();
     let admin_web_dir = state
         .config
@@ -157,10 +153,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     // Merge — each sub-router carries its own body limit.
     // Metrics → Trace → CORS applied once over the combined router.
-    let mut merged = api_router
-        .merge(media_router)
-        .merge(git_router)
-        .merge(git_policy_router);
+    let mut merged = api_router.merge(media_router);
+    if state.config.git_enabled {
+        merged = merged
+            .merge(api::git::git_router(state.clone()))
+            .merge(api::git::git_policy_router(state.clone()));
+    }
     if let Some(admin_router) = admin_router {
         merged = merged.merge(admin_router);
     }

@@ -85,6 +85,10 @@ const USAGE_METRICS_LOCK_KEY: i64 = 0x4255_5A5A_4D45_5452;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("--healthcheck") {
+        return healthcheck().await;
+    }
+
     // Install the ring CryptoProvider for rustls. Required before any rustls
     // TLS connection (rediss:// to ElastiCache, wss://, S3 over TLS): both
     // aws-lc-rs and ring are compiled in transitively, so rustls can't
@@ -493,9 +497,10 @@ async fn main() -> anyhow::Result<()> {
     // linearizable conditional-write axiom (A3) before serving git traffic.
     // Failure is fatal: a backend that cannot satisfy pointer CAS invalidates
     // the manifest-pointer protocol. This is a deployment gate, not a proof.
-    if std::env::var("BUZZ_GIT_CONFORMANCE_PROBE")
-        .map(|v| v != "false")
-        .unwrap_or(true)
+    if config.git_enabled
+        && std::env::var("BUZZ_GIT_CONFORMANCE_PROBE")
+            .map(|v| v != "false")
+            .unwrap_or(true)
     {
         let race_width = std::env::var("BUZZ_GIT_PROBE_WRITERS")
             .ok()
@@ -525,6 +530,8 @@ async fn main() -> anyhow::Result<()> {
             transport_drops = report.transport_drops,
             "git object-store backend admitted: A3 conformance probe passed"
         );
+    } else if !config.git_enabled {
+        info!("Git capability disabled; skipping Git object-store conformance probe");
     }
 
     // NIP-43: reconcile the event-backed roster for every provisioned
@@ -1091,6 +1098,38 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Probe the health listener without initializing the relay or its databases.
+/// The Elembra runtime is distroless, so Docker cannot rely on curl or a shell.
+async fn healthcheck() -> anyhow::Result<()> {
+    let port = std::env::var("BUZZ_HEALTH_PORT").unwrap_or_else(|_| "8080".to_string());
+    let address = format!("127.0.0.1:{port}");
+    let timeout = std::time::Duration::from_secs(2);
+    let mut stream = tokio::time::timeout(timeout, tokio::net::TcpStream::connect(&address))
+        .await
+        .map_err(|_| anyhow::anyhow!("healthcheck connection timed out"))??;
+    tokio::time::timeout(
+        timeout,
+        tokio::io::AsyncWriteExt::write_all(
+            &mut stream,
+            b"GET /_liveness HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+        ),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("healthcheck request timed out"))??;
+    let mut response = Vec::with_capacity(128);
+    tokio::time::timeout(
+        timeout,
+        tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("healthcheck response timed out"))??;
+    if response.starts_with(b"HTTP/1.1 200 ") || response.starts_with(b"HTTP/1.0 200 ") {
+        Ok(())
+    } else {
+        anyhow::bail!("healthcheck returned an unexpected HTTP status")
+    }
 }
 
 #[cfg(test)]
