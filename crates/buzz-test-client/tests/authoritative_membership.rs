@@ -19,11 +19,18 @@ impl Drop for Relay {
     }
 }
 
-fn launch(service: &Keys, relay: &Keys, database_url: &str) -> Relay {
+fn launch(service: &Keys, relay: Option<&Keys>, database_url: &str) -> Relay {
     let log = std::fs::File::create(std::env::temp_dir().join("membership-conformance-relay.log"))
         .unwrap();
+    let mut command =
+        Command::new(std::env::var("BUZZ_TEST_RELAY_BINARY").expect("build buzz-relay first"));
+    if let Some(relay) = relay {
+        command.env("BUZZ_RELAY_PRIVATE_KEY", relay.secret_key().to_secret_hex());
+    } else {
+        command.env_remove("BUZZ_RELAY_PRIVATE_KEY");
+    }
     Relay(
-        Command::new(std::env::var("BUZZ_TEST_RELAY_BINARY").expect("build buzz-relay first"))
+        command
             .env("DATABASE_URL", database_url)
             .env("REDIS_URL", std::env::var("BUZZ_TEST_REDIS_URL").unwrap())
             .env("RELAY_URL", "ws://localhost:55443")
@@ -32,13 +39,12 @@ fn launch(service: &Keys, relay: &Keys, database_url: &str) -> Relay {
             .env("BUZZ_METRICS_PORT", "55445")
             .env("BUZZ_AUTO_MIGRATE", "true")
             .env("BUZZ_GIT_ENABLED", "false")
-            .env("BUZZ_RELAY_PRIVATE_KEY", relay.secret_key().to_secret_hex())
             .env("RELAY_OWNER_PUBKEY", service.public_key().to_hex())
             .env(
                 "RELAY_TRUSTED_SERVICE_PUBKEYS",
                 service.public_key().to_hex(),
             )
-            .env("BUZZ_REQUIRE_AUTH_TOKEN", "true")
+            .env("BUZZ_REQUIRE_AUTH_TOKEN", relay.is_some().to_string())
             .env("BUZZ_REQUIRE_RELAY_MEMBERSHIP", "false")
             .stdout(Stdio::from(log.try_clone().unwrap()))
             .stderr(Stdio::from(log))
@@ -183,7 +189,7 @@ async fn live_membership_contract() {
         .timeout(Duration::from_secs(3))
         .build()
         .unwrap();
-    let mut process = launch(&service, &relay, database_url.as_str());
+    let mut process = launch(&service, Some(&relay), database_url.as_str());
     ready(&http).await;
     let pool = PgPool::connect(database_url.as_str()).await.unwrap();
     let c: Uuid = sqlx::query_scalar("SELECT id FROM communities WHERE host='localhost:55443'")
@@ -370,7 +376,7 @@ async fn live_membership_contract() {
     let after: Value = sqlx::query_scalar(snapshot).fetch_one(&pool).await.unwrap();
     assert_eq!(before, after);
     drop(process);
-    process = launch(&service, &relay, database_url.as_str());
+    process = launch(&service, Some(&relay), database_url.as_str());
     ready(&http).await;
     assert_eq!(
         read(&http, &service, &relay, c, &p).await["membership_revision"],
@@ -413,6 +419,15 @@ async fn live_membership_contract() {
         .success());
     assert!(outage.is_err() || !outage.unwrap().status().is_success());
     drop(process);
+    let fallback = launch(&service, None, database_url.as_str());
+    ready(&http).await;
+    let response = http
+        .post("http://localhost:55443/api/v1/relay/membership/check")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    drop(fallback);
     pool.close().await;
     sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {name}")))
         .execute(&admin)

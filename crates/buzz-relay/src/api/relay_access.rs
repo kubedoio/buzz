@@ -64,6 +64,13 @@ pub async fn check_membership(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // The development fallback key must never attest authoritative membership.
+    if state.config.relay_private_key.is_none() {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "relay identity is not configured",
+        ));
+    }
     let host = headers
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())

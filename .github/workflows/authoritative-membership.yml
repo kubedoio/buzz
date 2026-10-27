@@ -32,7 +32,8 @@ jobs:
         run: |
           cargo fmt --all --check
           cargo build -p buzz-relay
-          cargo clippy -p buzz-db -p buzz-test-client --all-targets -- -D warnings
+          cargo clippy -p buzz-db -p buzz-relay -p buzz-test-client --all-targets -- -D warnings
+          cargo test -p buzz-db -p buzz-relay -p buzz-test-client --lib
       - name: Migration and PostgreSQL contract
         run: cargo test -p buzz-db --test membership_v1alpha2 -- --ignored
       - name: Actual relay conformance

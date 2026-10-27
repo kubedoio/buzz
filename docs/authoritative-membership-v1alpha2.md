@@ -15,6 +15,9 @@ membership returns 503; communities that have not opted in return 404
 (host-resolution failure may also return 404). No failure
 is an absence result. The query performs no writes and reads only the primary
 pool, never the replica router, channel visibility or signed roster snapshots.
+Without a configured stable relay private key, this endpoint returns 503 before
+authentication, replay consumption or database access. The public development
+fallback key must never sign authoritative membership responses.
 
 ## State and ordering
 
