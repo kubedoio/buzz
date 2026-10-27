@@ -162,6 +162,10 @@ async fn mutate(
 async fn live_membership_contract() {
     let mut database_url =
         url::Url::parse(&std::env::var("BUZZ_TEST_DATABASE_URL").unwrap()).unwrap();
+    assert!(
+        database_url.query().is_none(),
+        "test database URL must not redirect through connection parameters"
+    );
     assert!(matches!(
         database_url.host_str(),
         Some("127.0.0.1" | "localhost")
@@ -350,7 +354,11 @@ async fn live_membership_contract() {
         1
     );
     // Reads must leave all authoritative tables and receipts untouched.
-    let before:(i64,i64,i64)=sqlx::query_as("SELECT (SELECT count(*) FROM relay_members),(SELECT count(*) FROM relay_membership_state),(SELECT count(*) FROM relay_membership_receipts)").fetch_one(&pool).await.unwrap();
+    let snapshot = "SELECT jsonb_build_array( \
+        (SELECT jsonb_agg(to_jsonb(m) ORDER BY community_id,pubkey) FROM relay_members m), \
+        (SELECT jsonb_agg(to_jsonb(s) ORDER BY community_id,pubkey) FROM relay_membership_state s), \
+        (SELECT jsonb_agg(to_jsonb(r) ORDER BY operation_id) FROM relay_membership_receipts r))";
+    let before: Value = sqlx::query_scalar(snapshot).fetch_one(&pool).await.unwrap();
     read(
         &http,
         &service,
@@ -359,7 +367,7 @@ async fn live_membership_contract() {
         &Keys::generate().public_key().to_hex(),
     )
     .await;
-    let after:(i64,i64,i64)=sqlx::query_as("SELECT (SELECT count(*) FROM relay_members),(SELECT count(*) FROM relay_membership_state),(SELECT count(*) FROM relay_membership_receipts)").fetch_one(&pool).await.unwrap();
+    let after: Value = sqlx::query_scalar(snapshot).fetch_one(&pool).await.unwrap();
     assert_eq!(before, after);
     drop(process);
     process = launch(&service, &relay, database_url.as_str());

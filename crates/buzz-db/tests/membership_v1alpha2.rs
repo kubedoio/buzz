@@ -8,13 +8,21 @@ use uuid::Uuid;
 #[ignore = "requires disposable PostgreSQL with database creation permission"]
 async fn migration_receipts_concurrency_and_restart() {
     let url = std::env::var("BUZZ_TEST_DATABASE_URL").expect("disposable database URL required");
-    let admin = PgPool::connect(&url).await.unwrap();
+    assert!(
+        !url.contains('?'),
+        "test database URL must not redirect through connection parameters"
+    );
+    let mut options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
+    assert!(matches!(
+        options.get_host(),
+        "127.0.0.1" | "localhost" | "::1"
+    ));
+    let admin = PgPool::connect_with(options.clone()).await.unwrap();
     let name = format!("membership_{}", Uuid::new_v4().simple());
     sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
         .execute(&admin)
         .await
         .unwrap();
-    let mut options: sqlx::postgres::PgConnectOptions = url.parse().unwrap();
     options = options.database(&name);
     let pool = sqlx::postgres::PgPoolOptions::new()
         .connect_with(options.clone())
@@ -314,6 +322,54 @@ async fn migration_receipts_concurrency_and_restart() {
             .await
             .unwrap(),
         ("active".into(), i64::MAX)
+    );
+    let stale_admin = "88".repeat(32);
+    let stale_target = "99".repeat(32);
+    let grant_admin = ConditionalMembership {
+        pubkey: &stale_admin,
+        role: "admin",
+        operation_id: Uuid::new_v4(),
+        ..add
+    };
+    db.conditional_membership(community, &grant_admin)
+        .await
+        .unwrap();
+    let mut stale_snapshot = pool.begin().await.unwrap();
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *stale_snapshot)
+        .await
+        .unwrap();
+    sqlx::query("SELECT 1 FROM relay_members")
+        .execute(&mut *stale_snapshot)
+        .await
+        .unwrap();
+    let revoke_admin = ConditionalMembership {
+        kind: 9031,
+        role: "member",
+        operation_id: Uuid::new_v4(),
+        expected_revision: 1,
+        ..grant_admin
+    };
+    db.conditional_membership(community, &revoke_admin)
+        .await
+        .unwrap();
+    let result = sqlx::query("SELECT * FROM mutate_relay_membership($1,$2,$3,$4,9030,'member',0)")
+        .bind(c)
+        .bind(&stale_target)
+        .bind(&stale_admin)
+        .bind(Uuid::new_v4())
+        .execute(&mut *stale_snapshot)
+        .await;
+    stale_snapshot.rollback().await.unwrap();
+    assert!(
+        result.is_err(),
+        "stale snapshot admitted an already-revoked administrator"
+    );
+    assert_eq!(
+        db.authoritative_membership(community, &stale_target)
+            .await
+            .unwrap(),
+        ("absent".into(), 0)
     );
     drop(db);
     pool.close().await;

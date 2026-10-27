@@ -76,6 +76,10 @@ DECLARE
     result TEXT := 'ok';
     did_change BOOLEAN := false;
 BEGIN
+    -- Authorization and receipts must use a fresh snapshot after the community lock.
+    IF current_setting('transaction_isolation') <> 'read committed' THEN
+        RAISE EXCEPTION 'conditional membership requires READ COMMITTED isolation';
+    END IF;
     SELECT membership_v1alpha2 INTO enabled FROM communities WHERE id = c FOR UPDATE;
     IF enabled IS DISTINCT FROM true THEN RAISE EXCEPTION 'v1alpha2 not enabled'; END IF;
     IF p !~ '^[0-9a-f]{64}$' OR a !~ '^[0-9a-f]{64}$'

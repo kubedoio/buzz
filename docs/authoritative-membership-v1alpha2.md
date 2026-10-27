@@ -32,8 +32,10 @@ locks the community (including actor-role authorization), creates/locks the
 target revision row, checks the receipt and expected revision, and commits
 the membership effect, revision and receipt together. Community serialization
 is deliberately conservative. Different operation IDs racing at the same
-revision cannot both change state. PostgreSQL deadlock/transaction failures
-roll back the entire operation and must be retried using the same operation
+revision cannot both change state. Conditional transactions require READ
+COMMITTED; older repeatable snapshots are rejected before authorization.
+PostgreSQL deadlock/transaction failures roll back the entire operation and
+must be retried using the same operation
 ID after reading current state. Bigint overflow fails closed, never wraps.
 
 Identical operations return their stored outcome, even after later changes;
