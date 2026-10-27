@@ -1,0 +1,43 @@
+name: Authoritative membership v1alpha2
+on:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  membership:
+    name: Buzz v1alpha2 PostgreSQL and live conformance
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      BUZZ_TEST_REDIS_URL: redis://127.0.0.1:56442
+      BUZZ_TEST_POSTGRES_CONTAINER: m41-buzz-postgres
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - name: Disposable dependencies
+        run: |
+          test_db_password=$(openssl rand -hex 24)
+          echo "::add-mask::${test_db_password}"
+          echo "BUZZ_TEST_DATABASE_URL=postgres://buzz:${test_db_password}@127.0.0.1:55442/buzz" >> "$GITHUB_ENV"
+          docker run -d --name m41-buzz-postgres -e POSTGRES_USER=buzz -e POSTGRES_PASSWORD="${test_db_password}" -e POSTGRES_DB=buzz -p 127.0.0.1:55442:5432 postgres:16
+          docker run -d --name m41-buzz-redis -p 127.0.0.1:56442:6379 redis:7-alpine
+          for attempt in $(seq 1 30); do
+            if docker exec m41-buzz-postgres pg_isready -U buzz; then exit 0; fi
+            sleep 1
+          done
+          exit 1
+      - name: Build and check
+        run: |
+          cargo fmt --all --check
+          cargo build -p buzz-relay
+          cargo clippy -p buzz-db -p buzz-test-client --all-targets -- -D warnings
+      - name: Migration and PostgreSQL contract
+        run: cargo test -p buzz-db --test membership_v1alpha2 -- --ignored
+      - name: Actual relay conformance
+        env:
+          BUZZ_TEST_RELAY_BINARY: ${{ github.workspace }}/target/debug/buzz-relay
+        run: cargo test -p buzz-test-client --test authoritative_membership -- --ignored --nocapture
+      - name: Relay diagnostics
+        if: failure()
+        run: tail -100 /tmp/membership-conformance-relay.log
