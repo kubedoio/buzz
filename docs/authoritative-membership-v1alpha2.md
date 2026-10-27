@@ -24,6 +24,12 @@ fallback key must never sign authoritative membership responses.
 `relay_members` remains the sole active-membership authority.
 `relay_membership_state` retains revisions and revocation tombstones;
 `relay_membership_receipts` retains operation outcomes indefinitely.
+Operation UUID uniqueness is deployment-wide and the receipt table is explicitly
+registered as a global replay registry. Receipt ownership/access remains bound
+to the authorized community, actor and exact command. Reusing a known UUID in
+another community fails closed; a concurrent collision can abort the transaction
+and must be retried with its original ID. This intentionally couples availability
+for colliding IDs; the HTTP mutation handler does not disclose the prior revision.
 Migration 0029 locks membership writes while seeding all active records at
 revision one. Historically removed keys have no recoverable authoritative
 history and initially read absent at zero. Do not reconstruct tombstones from

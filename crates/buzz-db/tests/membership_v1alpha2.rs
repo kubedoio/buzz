@@ -255,6 +255,12 @@ async fn migration_receipts_concurrency_and_restart() {
         role: "member",
         expected_revision: 1,
     };
+    let receipts_before: serde_json::Value = sqlx::query_scalar(
+        "SELECT jsonb_agg(to_jsonb(r) ORDER BY operation_id) FROM relay_membership_receipts r",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(
         db.conditional_membership(other, &foreign).await.unwrap().0,
         "operation_conflict"
@@ -263,6 +269,51 @@ async fn migration_receipts_concurrency_and_restart() {
         db.authoritative_membership(other, &key).await.unwrap(),
         ("active".into(), 3)
     );
+    assert_eq!(
+        db.authoritative_membership(community, &key).await.unwrap(),
+        ("revoked".into(), 2)
+    );
+    let receipts_after: serde_json::Value = sqlx::query_scalar(
+        "SELECT jsonb_agg(to_jsonb(r) ORDER BY operation_id) FROM relay_membership_receipts r",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(receipts_before, receipts_after);
+    let collision_key = "ab".repeat(32);
+    let collision = ConditionalMembership {
+        pubkey: &collision_key,
+        operation_id: Uuid::new_v4(),
+        kind: 9030,
+        expected_revision: 0,
+        ..foreign
+    };
+    let (first, second) = tokio::join!(
+        db.conditional_membership(community, &collision),
+        db.conditional_membership(other, &collision)
+    );
+    let first_changed = first.is_ok_and(|r| r == ("ok".into(), 1, true));
+    let second_changed = second.is_ok_and(|r| r == ("ok".into(), 1, true));
+    assert_ne!(first_changed, second_changed);
+    for (scope, changed) in [(community, first_changed), (other, second_changed)] {
+        assert_eq!(
+            db.authoritative_membership(scope, &collision_key)
+                .await
+                .unwrap(),
+            if changed {
+                ("active".into(), 1)
+            } else {
+                ("absent".into(), 0)
+            }
+        );
+    }
+    let receipt_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM relay_membership_receipts WHERE operation_id=$1")
+            .bind(collision.operation_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(receipt_count, 1);
     // Re-open all database connections: revisions and receipts remain durable.
     let crash_key = "66".repeat(32);
     let crash_op = Uuid::new_v4();

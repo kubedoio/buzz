@@ -1107,6 +1107,9 @@ CREATE TABLE relay_membership_receipts (
     revision BIGINT NOT NULL,
     PRIMARY KEY (operation_id)
 );
+-- UUID replay protection spans communities; receipt access remains community-authorized.
+INSERT INTO _operator_global_tables (table_name, reason) VALUES
+    ('relay_membership_receipts', 'deployment-wide operation UUID replay registry; receipts remain bound to the authorized community, actor and exact command');
 
 -- Cover invites, operator tools, startup, ownership transfer and future writers.
 -- An AFTER trigger also covers ON CONFLICT paths without rejecting a harmless
