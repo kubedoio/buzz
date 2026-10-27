@@ -659,8 +659,16 @@ async fn handle_active_audio_connection(
     let (data_tx, data_rx) = mpsc::channel::<WsMessage>(16);
     let (ctrl_tx, ctrl_rx) = mpsc::channel::<WsMessage>(8);
 
-    let send_cancel = cancel.child_token();
-    let send_task = tokio::spawn(send_loop(ws_send, data_rx, ctrl_rx, send_cancel));
+    let send_cancel = cancel.clone();
+    let send_task = tokio::spawn(send_loop(
+        ws_send,
+        data_rx,
+        ctrl_rx,
+        send_cancel,
+        Arc::clone(&state),
+        tenant.community(),
+        pubkey,
+    ));
 
     let hb_cancel = cancel.clone();
     let hb_missed = Arc::clone(&missed_pongs);
@@ -778,6 +786,9 @@ async fn handle_active_audio_connection(
         Arc::clone(&missed_pongs),
         cancel.clone(),
         remote_session.as_mut(),
+        Arc::clone(&state),
+        tenant.community(),
+        pubkey,
     )
     .await;
 
@@ -953,6 +964,9 @@ async fn recv_loop(
     missed_pongs: Arc<AtomicU8>,
     cancel: CancellationToken,
     mut remote_session: Option<&mut crate::audio::join::RemoteHuddleSession>,
+    state: Arc<AppState>,
+    community: buzz_core::CommunityId,
+    pubkey: nostr::PublicKey,
 ) {
     use crate::audio::wire::{FrameHeader, V2_HEADER_LEN};
 
@@ -963,6 +977,9 @@ async fn recv_loop(
             msg = ws_recv.next() => {
                 match msg {
                     Some(Ok(WsMessage::Binary(data))) => {
+                        if !audio_membership_allowed(&state, community, &pubkey, &cancel).await {
+                            break;
+                        }
                         if data.len() > MAX_AUDIO_FRAME_BYTES {
                             warn!(peer_id = %peer_id, bytes = data.len(), "audio frame too large — dropping");
                             continue;
@@ -1061,10 +1078,16 @@ async fn send_loop(
     mut data_rx: mpsc::Receiver<WsMessage>,
     mut ctrl_rx: mpsc::Receiver<WsMessage>,
     cancel: CancellationToken,
+    state: Arc<AppState>,
+    community: buzz_core::CommunityId,
+    pubkey: nostr::PublicKey,
 ) {
     loop {
         // Priority: drain all pending control frames before data.
         while let Ok(ctrl_msg) = ctrl_rx.try_recv() {
+            if !audio_membership_allowed(&state, community, &pubkey, &cancel).await {
+                return;
+            }
             if ws_send.send(ctrl_msg).await.is_err() {
                 return;
             }
@@ -1077,9 +1100,11 @@ async fn send_loop(
                 break;
             }
             Some(ctrl_msg) = ctrl_rx.recv() => {
+                if !audio_membership_allowed(&state, community, &pubkey, &cancel).await { break; }
                 if ws_send.send(ctrl_msg).await.is_err() { break; }
             }
             Some(msg) = data_rx.recv() => {
+                if !audio_membership_allowed(&state, community, &pubkey, &cancel).await { break; }
                 if ws_send.send(msg).await.is_err() { break; }
             }
         }
@@ -1122,6 +1147,24 @@ async fn audio_forward_loop(
             }
         }
     }
+}
+
+async fn audio_membership_allowed(
+    state: &AppState,
+    community: buzz_core::CommunityId,
+    pubkey: &nostr::PublicKey,
+    cancel: &CancellationToken,
+) -> bool {
+    // shortcut: primary reads per frame; revisit with a proven revocation fence if media load requires it.
+    if matches!(
+        crate::api::relay_members::check_v1alpha2_membership(state, community, pubkey.as_bytes(),)
+            .await,
+        Ok(None | Some(true))
+    ) {
+        return true;
+    }
+    cancel.cancel();
+    false
 }
 
 async fn heartbeat_loop(

@@ -67,6 +67,20 @@ In a reviewed maintenance transaction, lock `relay_members` in SHARE ROW
 EXCLUSIVE mode and set that community's `membership_v1alpha2=true`.
 This is an operator database migration step, not an Elembra database API.
 No production community is enabled by this patch.
+Opt-in also requires exact-key ACTIVE membership for authenticated access,
+independent of the open-relay setting or NIP-OA owner delegation. An ABSENT or
+REVOKED key cannot authenticate, submit events or use a cached WebSocket session;
+live subscription fan-out rechecks the primary authority on every delivery.
+Anonymous WebSocket requests are denied for opted-in communities. Provision
+every service/agent key explicitly before opt-in; delegated agents must also
+have their own ACTIVE membership. Legacy communities retain their open/delegated
+admission behavior.
+Huddle audio revalidates membership before forwarding incoming media and before
+sending outgoing audio/control frames, including cross-pod sessions. Denial or
+database unavailability cancels the connection. This conservative enforcement
+adds primary reads per distinct live event recipient and per audio frame; media
+throughput and high-fanout qualification must measure this cost before release.
+No cache may turn a revoked key into an admitted key.
 
 For enabled communities the database guard rejects every unversioned
 membership/role change, including invites, ownership transfer, operator

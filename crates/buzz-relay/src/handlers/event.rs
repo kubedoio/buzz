@@ -98,7 +98,8 @@ where
 
 /// Drop recipients without access before fan-out on a private channel.
 ///
-/// Open and channel-less events skip membership filtering (open channel-scoped
+/// V1alpha2 relay admission is always revalidated. Open and channel-less events
+/// skip the additional channel-membership filter (open channel-scoped
 /// events pay one visibility lookup; see `channel_visibility_cached`). For a
 /// private channel, each recipient is kept only if its connection's
 /// authenticated pubkey is a current member; unknown/unauthenticated recipients
@@ -129,6 +130,40 @@ pub async fn filter_fanout_by_access(
             state.conn_manager.community_for_conn(*conn_id) == Some(community_id)
         })
         .collect();
+
+    if matches.is_empty() {
+        return matches;
+    }
+    // Revalidate relay membership for live subscriptions, including cross-node delivery.
+    let matches = match state.db.membership_v1alpha2(community_id).await {
+        Ok(false) => matches,
+        Ok(true) => {
+            let mut admitted = Vec::with_capacity(matches.len());
+            // shortcut: per-connection primary reads; batch if measured fan-out load requires it.
+            let mut decisions = HashMap::new();
+            for (conn_id, sub_id) in matches {
+                let allowed = if let Some(allowed) = decisions.get(&conn_id) {
+                    *allowed
+                } else {
+                    let allowed = match state.conn_manager.pubkey_for_conn(conn_id) {
+                        Some(key) => state
+                            .db
+                            .authoritative_membership(community_id, &hex::encode(key))
+                            .await
+                            .is_ok_and(|(membership, _)| membership == "active"),
+                        None => false,
+                    };
+                    decisions.insert(conn_id, allowed);
+                    allowed
+                };
+                if allowed {
+                    admitted.push((conn_id, sub_id));
+                }
+            }
+            admitted
+        }
+        Err(_) => return Vec::new(),
+    };
 
     // Author-only kinds (NIP-ER reminders) may only ever be delivered to the
     // event's own author. This gate lives here — the chokepoint shared by the

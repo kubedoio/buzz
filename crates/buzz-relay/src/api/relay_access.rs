@@ -125,6 +125,8 @@ pub async fn check_membership(
             "membership v1alpha2 not enabled",
         ));
     }
+    // A delayed primary read must not mint a fresh timestamp for an older observation.
+    let evaluated_at = nostr::Timestamp::now().as_secs();
     let (membership, revision) = state
         .db
         .authoritative_membership(tenant.community(), &req.pubkey)
@@ -135,7 +137,7 @@ pub async fn check_membership(
         serde_json::json!({
             "request_id": req.request_id, "community_id": req.community_id, "pubkey": req.pubkey,
             "membership": membership, "membership_revision": revision,
-            "evaluated_at": nostr::Timestamp::now().as_secs(),
+            "evaluated_at": evaluated_at,
         }),
     )
 }

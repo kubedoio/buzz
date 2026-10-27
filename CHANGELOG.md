@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Enforce exact active v1alpha2 membership for open/delegated access, existing WebSocket sessions and live subscriptions; preserve observation freshness across delayed reads.
 - Reject authoritative membership reads with HTTP 503 when a stable relay signing identity is not configured.
 
 ## v0.5.8

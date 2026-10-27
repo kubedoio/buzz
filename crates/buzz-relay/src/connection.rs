@@ -630,9 +630,47 @@ async fn enforce_ws_admission(
         let auth = conn.auth_state.read().await;
         match &*auth {
             AuthState::Authenticated(ctx) => (ctx.pubkey, ctx.agent_owner_pubkey.is_some()),
-            _ => return true,
+            _ => {
+                drop(auth);
+                if matches!(
+                    state.db.membership_v1alpha2(conn.tenant.community()).await,
+                    Ok(false)
+                ) {
+                    return true;
+                }
+                let _ = conn.ctrl_tx.try_send(WsMessage::Text(
+                    RelayMessage::notice("auth-required: authoritative relay membership required")
+                        .into(),
+                ));
+                conn.cancel.cancel();
+                return false;
+            }
         }
     };
+
+    // Authentication is cached; v1alpha2 membership must be checked on every message.
+    if !matches!(
+        crate::api::relay_members::check_v1alpha2_membership(
+            state,
+            conn.tenant.community(),
+            pubkey.as_bytes(),
+        )
+        .await,
+        Ok(None | Some(true))
+    ) {
+        let reason = "blocked: authoritative relay membership required";
+        let rejection = match msg {
+            ClientMessage::Event(event) => RelayMessage::ok(&event.id.to_hex(), false, reason),
+            ClientMessage::Req { sub_id, .. } | ClientMessage::Count { sub_id, .. } => {
+                RelayMessage::closed(sub_id, reason)
+            }
+            _ => return false,
+        };
+        let _ = conn.ctrl_tx.try_send(WsMessage::Text(rejection.into()));
+        *conn.auth_state.write().await = AuthState::Failed;
+        conn.cancel.cancel();
+        return false;
+    }
 
     let limits = &state.auth.config().rate_limits;
     let (ws_window_secs, ws_limit) =

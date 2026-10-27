@@ -35,7 +35,9 @@ jobs:
           cargo clippy -p buzz-db -p buzz-relay -p buzz-test-client --all-targets -- -D warnings
           cargo test -p buzz-db -p buzz-relay -p buzz-test-client --lib
       - name: Migration and PostgreSQL contract
-        run: cargo test -p buzz-db --test membership_v1alpha2 -- --ignored
+        run: |
+          cargo test -p buzz-db --lib migration::tests -- --ignored --test-threads=1
+          cargo test -p buzz-db --test membership_v1alpha2 -- --ignored
       - name: Actual relay conformance
         env:
           BUZZ_TEST_RELAY_BINARY: ${{ github.workspace }}/target/debug/buzz-relay
