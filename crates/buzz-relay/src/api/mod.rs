@@ -45,7 +45,7 @@ pub mod relay_members {
     /// Transport-neutral outcome of a relay-membership check.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum MembershipDecision {
-        /// Relay membership enforcement is disabled.
+        /// Legacy relay membership enforcement is disabled.
         OpenRelay,
         /// Caller is directly present in `relay_members`.
         Member,
@@ -65,6 +65,13 @@ pub mod relay_members {
         pubkey_bytes: &[u8],
         auth_tag_header: Option<&str>,
     ) -> Result<MembershipDecision, String> {
+        if let Some(admitted) = check_v1alpha2_membership(state, community, pubkey_bytes).await? {
+            return Ok(if admitted {
+                MembershipDecision::Member
+            } else {
+                MembershipDecision::Denied
+            });
+        }
         if !state.config.require_relay_membership {
             return Ok(MembershipDecision::OpenRelay);
         }
@@ -111,13 +118,37 @@ pub mod relay_members {
         Ok(MembershipDecision::Denied)
     }
 
+    /// Opted-in communities require the exact key to be ACTIVE, even on open
+    /// relays or with owner delegation. `None` preserves legacy admission.
+    pub async fn check_v1alpha2_membership(
+        state: &AppState,
+        community: CommunityId,
+        pubkey_bytes: &[u8],
+    ) -> Result<Option<bool>, String> {
+        if !state
+            .db
+            .membership_v1alpha2(community)
+            .await
+            .map_err(|e| e.to_string())?
+        {
+            return Ok(None);
+        }
+        let (membership, _) = state
+            .db
+            .authoritative_membership(community, &hex::encode(pubkey_bytes))
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(Some(membership == "active"))
+    }
+
     /// Enforce relay membership for a pubkey, with NIP-OA agent delegation fallback.
     ///
     /// Returns `Ok(Some(owner_pubkey))` when the agent is not a direct member but
     /// its NIP-OA owner *is* — access is granted via delegation.
     ///
-    /// On open relays (`require_relay_membership = false`), returns `Ok(None)`
-    /// immediately — no membership check is performed. Callers that need NIP-OA
+    /// On legacy open relays (`require_relay_membership = false`), returns `Ok(None)`.
+    /// Opted-in v1alpha2 communities always require exact-key ACTIVE membership.
+    /// Callers that need NIP-OA
     /// owner extraction on open relays should call [`extract_nip_oa_owner`] directly.
     ///
     /// Returns `Ok(None)` when the caller is a direct member (closed relay) or when

@@ -348,6 +348,7 @@ mod tests {
             "push_gateway_delivery_request_replays",
             "product_feedback",
             "replica_heartbeat",
+            "relay_membership_receipts",
         ] {
             if normalized[insert_pos..].contains(&format!("'{value}'")) {
                 globals.insert(value.to_owned());
@@ -561,7 +562,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 28);
+        assert_eq!(migrations.len(), 29);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -946,6 +947,23 @@ mod tests {
             long_reactions.contains("ALTER TABLE reactions ALTER COLUMN emoji TYPE VARCHAR(66)")
         );
         assert!(desired_schema.contains("emoji               VARCHAR(66) NOT NULL"));
+
+        assert_eq!(migrations[28].version, 29);
+        let membership = migrations[28].sql.as_str();
+        assert!(membership.contains("CREATE TABLE relay_membership_state"));
+        assert!(membership.contains("CREATE TABLE relay_membership_receipts"));
+        assert!(desired_schema.contains("CREATE TABLE relay_membership_receipts"));
+        assert!(membership.contains("community_id UUID NOT NULL REFERENCES communities(id)"));
+        assert!(membership.contains("PRIMARY KEY (operation_id)"));
+        assert!(membership.contains(
+            "'relay_membership_receipts', 'deployment-wide operation UUID replay registry"
+        ));
+        assert!(membership.contains("prior.community_id <> c"));
+        assert!(membership.contains("prior.actor <> a"));
+        assert!(membership.contains("prior.pubkey <> p"));
+        assert!(membership.contains("prior.kind <> k"));
+        assert!(membership.contains("prior.role <> r"));
+        assert!(membership.contains("prior.expected_revision <> expected"));
     }
 
     #[test]
@@ -1188,7 +1206,7 @@ mod tests {
         run_migrations(&pool)
             .await
             .expect("retry succeeds after operator repair");
-        assert_eq!(applied_versions(&pool).await.last().copied(), Some(27));
+        assert_eq!(applied_versions(&pool).await.last().copied(), Some(29));
     }
 
     #[tokio::test]

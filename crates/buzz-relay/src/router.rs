@@ -115,6 +115,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             post(api::relay_access::check_access),
         )
         .route(
+            "/api/v1/relay/membership/check",
+            post(api::relay_access::check_membership),
+        )
+        .route(
             "/api/v1/relay/access/check-batch",
             post(api::relay_access::check_access_batch),
         )

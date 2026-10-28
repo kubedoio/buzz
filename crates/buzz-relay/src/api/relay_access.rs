@@ -47,6 +47,100 @@ use super::{api_error, internal_error};
 
 /// The endpoint path — the NIP-98 `u` tag must match the exact request URL.
 const ACCESS_CHECK_PATH: &str = "/api/v1/relay/access/check";
+const MEMBERSHIP_CHECK_PATH: &str = "/api/v1/relay/membership/check";
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MembershipCheckRequest {
+    request_id: String,
+    community_id: String,
+    pubkey: String,
+}
+
+/// Authoritative exact-key membership read. This never creates a state row.
+/// Authentication, replay protection and signing reuse the v1alpha1 boundary.
+pub async fn check_membership(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    // The development fallback key must never attest authoritative membership.
+    if state.config.relay_private_key.is_none() {
+        return Err(api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "relay identity is not configured",
+        ));
+    }
+    let host = headers
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let tenant = crate::tenant::bind_community(&state.db, host)
+        .await
+        .map_err(|_| api_error(StatusCode::NOT_FOUND, "unconfigured community"))?;
+    let url = nip98_expected_url(&state.config.relay_url, &tenant, MEMBERSHIP_CHECK_PATH);
+    let (caller, event_id) =
+        verify_bridge_auth_with_options(&headers, "POST", &url, Some(&body), true, true)?;
+    if !state
+        .config
+        .relay_trusted_service_pubkeys
+        .contains(&caller.to_hex())
+    {
+        return Err(api_error(StatusCode::UNAUTHORIZED, "untrusted caller"));
+    }
+    enforce_http_admission(&state, &tenant, &caller).await?;
+    check_nip98_replay(&state, &tenant, event_id).await?;
+    let req: MembershipCheckRequest = serde_json::from_slice(&body)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "malformed membership request"))?;
+    let nonce = uuid::Uuid::parse_str(&req.request_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid request_id"))?;
+    let community = uuid::Uuid::parse_str(&req.community_id)
+        .map_err(|_| api_error(StatusCode::BAD_REQUEST, "invalid community_id"))?;
+    if nonce.is_nil()
+        || nonce.to_string() != req.request_id
+        || community.to_string() != req.community_id
+        || req.pubkey.len() != 64
+        || !req
+            .pubkey
+            .bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+        || nostr::PublicKey::from_hex(&req.pubkey).is_err()
+    {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid membership request",
+        ));
+    }
+    if community != *tenant.community().as_uuid() {
+        return Err(api_error(StatusCode::NOT_FOUND, "community mismatch"));
+    }
+    let enabled = state
+        .db
+        .membership_v1alpha2(tenant.community())
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "membership unavailable"))?;
+    if !enabled {
+        return Err(api_error(
+            StatusCode::NOT_FOUND,
+            "membership v1alpha2 not enabled",
+        ));
+    }
+    // A delayed primary read must not mint a fresh timestamp for an older observation.
+    let evaluated_at = nostr::Timestamp::now().as_secs();
+    let (membership, revision) = state
+        .db
+        .authoritative_membership(tenant.community(), &req.pubkey)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "membership unavailable"))?;
+    sign_response(
+        &state,
+        serde_json::json!({
+            "request_id": req.request_id, "community_id": req.community_id, "pubkey": req.pubkey,
+            "membership": membership, "membership_revision": revision,
+            "evaluated_at": evaluated_at,
+        }),
+    )
+}
 /// The batch endpoint path — the NIP-98 `u` tag must match the exact request URL.
 const ACCESS_CHECK_BATCH_PATH: &str = "/api/v1/relay/access/check-batch";
 /// The channel-registry endpoint path — the NIP-98 `u` tag must match the
