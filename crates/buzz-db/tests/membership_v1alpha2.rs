@@ -178,7 +178,7 @@ async fn migration_receipts_concurrency_and_restart() {
         db.authoritative_membership_state(community, &staged_key)
             .await
             .unwrap(),
-        ("active".into(), 1, true, None)
+        ("active".into(), 2, true, None)
     );
     assert_eq!(
         db.release_relay_membership(
@@ -192,6 +192,41 @@ async fn migration_receipts_concurrency_and_restart() {
         .await
         .unwrap(),
         "ok"
+    );
+    let overflow_key = "78".repeat(32);
+    let overflow_stage = Uuid::new_v4();
+    let overflow_admission = ConditionalMembership {
+        pubkey: &overflow_key,
+        actor: &owner,
+        operation_id: overflow_stage,
+        kind: 9030,
+        role: "member",
+        expected_revision: 0,
+    };
+    db.conditional_membership_with_gate(community, &overflow_admission, true)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE relay_membership_state SET revision=$3 WHERE community_id=$1 AND pubkey=$2",
+    )
+    .bind(c)
+    .bind(&overflow_key)
+    .bind(i64::MAX)
+    .execute(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        db.release_relay_membership(
+            community,
+            &overflow_key,
+            &owner,
+            Uuid::new_v4(),
+            overflow_stage,
+            i64::MAX,
+        )
+        .await
+        .unwrap(),
+        "revision_overflow"
     );
     // Absent removal creates a sticky tombstone; repeated removal is a no-op.
     cmd.pubkey = &historical;

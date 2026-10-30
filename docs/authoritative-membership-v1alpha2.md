@@ -56,10 +56,10 @@ configured trusted-service identity may stage or release membership. After
 Elembra commits local activation, its durable outbox sends another kind-9030
 command with a fresh `elembra-op`, the expected membership revision and
 `elembra-release-of=<staged operation UUID>`. Buzz releases only that exact
-still-active staged row and stores the release receipt in the deployment-wide
-operation registry. Relay OK acknowledges delivery only; the signed read-back
-proves the gate state. Ordinary kind-9030 admissions remain immediately
-sendable.
+still-active staged row, advances the membership revision and stores the release
+receipt in the deployment-wide operation registry. Relay OK acknowledges
+delivery only; the signed read-back proves the gate state. Ordinary kind-9030
+admissions remain immediately sendable.
 
 Identical operations return their stored outcome, even after later changes;
 this is a receipt, not current-membership proof. Conflicting operation-ID reuse

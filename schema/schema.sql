@@ -1289,9 +1289,11 @@ BEGIN
     ELSIF EXISTS (SELECT 1 FROM community_bans WHERE community_id = c AND pubkey = decode(p, 'hex')
         AND banned AND (ban_expires_at IS NULL OR ban_expires_at > now())) THEN
         result := 'target_banned';
+    ELSIF s.revision = 9223372036854775807 THEN
+        result := 'revision_overflow';
     ELSE
         UPDATE relay_membership_state
-        SET send_enabled = true, staged_operation_id = NULL
+        SET send_enabled = true, staged_operation_id = NULL, revision = revision + 1
         WHERE community_id = c AND pubkey = p;
     END IF;
     INSERT INTO relay_membership_receipts
