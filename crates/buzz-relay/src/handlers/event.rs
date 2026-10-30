@@ -148,9 +148,11 @@ pub async fn filter_fanout_by_access(
                     let allowed = match state.conn_manager.pubkey_for_conn(conn_id) {
                         Some(key) => state
                             .db
-                            .authoritative_membership(community_id, &hex::encode(key))
+                            .authoritative_membership_state(community_id, &hex::encode(key))
                             .await
-                            .is_ok_and(|(membership, _)| membership == "active"),
+                            .is_ok_and(|(membership, _, send_enabled, _)| {
+                                membership == "active" && send_enabled
+                            }),
                         None => false,
                     };
                     decisions.insert(conn_id, allowed);
