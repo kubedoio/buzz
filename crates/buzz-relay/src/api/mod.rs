@@ -133,12 +133,12 @@ pub mod relay_members {
         {
             return Ok(None);
         }
-        let (membership, _) = state
+        let (membership, _, send_enabled, _) = state
             .db
-            .authoritative_membership(community, &hex::encode(pubkey_bytes))
+            .authoritative_membership_state(community, &hex::encode(pubkey_bytes))
             .await
             .map_err(|e| e.to_string())?;
-        Ok(Some(membership == "active"))
+        Ok(Some(membership == "active" && send_enabled))
     }
 
     /// Enforce relay membership for a pubkey, with NIP-OA agent delegation fallback.

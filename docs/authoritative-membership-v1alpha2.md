@@ -8,8 +8,8 @@ The source is https://github.com/kubedoio/buzz; `buzz-elembra` is the image name
 `community_id` UUID strings and a lowercase public key. It uses the existing
 trusted-service NIP-98 authentication, mandatory payload hash, Redis replay
 guard, host binding and relay-signed kind-19030 envelope. Its content echoes
-all request fields and contains `membership`, `membership_revision` and
-`evaluated_at`. Bad bodies return 400, foreign/unconfigured communities 404,
+all request fields and contains `membership`, `membership_revision`,
+`send_enabled`, `staged_operation_id` and `evaluated_at`. Bad bodies return 400, foreign/unconfigured communities 404,
 and unauthenticated/untrusted callers 401. Unavailable or inconsistent
 membership returns 503; communities that have not opted in return 404
 (host-resolution failure may also return 404). No failure
@@ -22,7 +22,8 @@ fallback key must never sign authoritative membership responses.
 ## State and ordering
 
 `relay_members` remains the sole active-membership authority.
-`relay_membership_state` retains revisions and revocation tombstones;
+`relay_membership_state` retains revisions, revocation tombstones and the
+separate send gate used by staged admission;
 `relay_membership_receipts` retains operation outcomes indefinitely.
 Operation UUID uniqueness is deployment-wide and the receipt table is explicitly
 registered as a global replay registry. Receipt ownership/access remains bound
@@ -47,6 +48,19 @@ PostgreSQL deadlock/transaction failures roll back the entire operation and
 must be retried using the same operation
 ID after reading current state. Bigint overflow fails closed, never wraps.
 
+The trusted Elembra bridge may add `elembra-stage=true` to a kind-9030
+admission. Migration 0030 records its operation UUID and leaves the member
+active for signed membership read-back while `send_enabled=false`; EVENT, REQ
+and COUNT admission and live subscription fan-out deny that key. Only the
+configured trusted-service identity may stage or release membership. After
+Elembra commits local activation, its durable outbox sends another kind-9030
+command with a fresh `elembra-op`, the expected membership revision and
+`elembra-release-of=<staged operation UUID>`. Buzz releases only that exact
+still-active staged row and stores the release receipt in the deployment-wide
+operation registry. Relay OK acknowledges delivery only; the signed read-back
+proves the gate state. Ordinary kind-9030 admissions remain immediately
+sendable.
+
 Identical operations return their stored outcome, even after later changes;
 this is a receipt, not current-membership proof. Conflicting operation-ID reuse
 (including a different actor or role) fails. Stale revisions get durable
@@ -67,7 +81,8 @@ In a reviewed maintenance transaction, lock `relay_members` in SHARE ROW
 EXCLUSIVE mode and set that community's `membership_v1alpha2=true`.
 This is an operator database migration step, not an Elembra database API.
 No production community is enabled by this patch.
-Opt-in also requires exact-key ACTIVE membership for authenticated access,
+Opt-in also requires exact-key ACTIVE and send-enabled membership for
+authenticated access,
 independent of the open-relay setting or NIP-OA owner delegation. An ABSENT or
 REVOKED key cannot authenticate, submit events or use a cached WebSocket session;
 live subscription fan-out rechecks the primary authority on every delivery.
@@ -98,7 +113,7 @@ migration. No automatic destructive down migration is supplied.
 ## Validation and release gates
 
 The database test upgrades schema 28 with pre-existing memberships, exercises
-receipt conflicts, stale replay, concurrency, legacy compatibility and
+receipt conflicts, staged admission/release, stale replay, concurrency, legacy compatibility and
 connection reopening. The live test launches the actual compiled relay,
 uses migrated PostgreSQL and Redis, verifies NIP-98 and relay signatures,
 restarts the relay, and pauses only the named disposable test database to

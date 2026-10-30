@@ -4108,19 +4108,35 @@ impl Db {
         community: CommunityId,
         pubkey: &str,
     ) -> Result<(String, i64)> {
-        let (active, revision, revoked): (bool, Option<i64>, Option<bool>) = sqlx::query_as(
+        let (membership, revision, _, _) = self
+            .authoritative_membership_state(community, pubkey)
+            .await?;
+        Ok((membership, revision))
+    }
+
+    /// Read membership, revision and send eligibility in one primary snapshot.
+    pub async fn authoritative_membership_state(
+        &self,
+        community: CommunityId,
+        pubkey: &str,
+    ) -> Result<(String, i64, bool, Option<uuid::Uuid>)> {
+        let (active, revision, revoked, send_enabled, staged_operation_id): (bool, Option<i64>, Option<bool>, Option<bool>, Option<uuid::Uuid>) = sqlx::query_as(
             "SELECT EXISTS(SELECT 1 FROM relay_members WHERE community_id = $1 AND pubkey = $2), \
-             s.revision, s.revoked FROM (SELECT 1) seed LEFT JOIN relay_membership_state s \
+             s.revision, s.revoked, s.send_enabled, s.staged_operation_id FROM (SELECT 1) seed LEFT JOIN relay_membership_state s \
              ON s.community_id = $1 AND s.pubkey = $2",
         )
         .bind(community.as_uuid())
         .bind(pubkey)
         .fetch_one(&self.pool)
         .await?;
-        match (active, revision, revoked) {
-            (true, Some(r), Some(false)) if r > 0 => Ok(("active".into(), r)),
-            (false, Some(r), Some(true)) if r > 0 => Ok(("revoked".into(), r)),
-            (false, None | Some(0), None | Some(false)) => Ok(("absent".into(), 0)),
+        match (active, revision, revoked, send_enabled, staged_operation_id) {
+            (true, Some(r), Some(false), Some(enabled), staged) if r > 0 => {
+                Ok(("active".into(), r, enabled, staged))
+            }
+            (false, Some(r), Some(true), _, _) if r > 0 => Ok(("revoked".into(), r, false, None)),
+            (false, None | Some(0), None | Some(false), None | Some(true), None) => {
+                Ok(("absent".into(), 0, true, None))
+            }
             _ => Err(DbError::InvalidData("inconsistent membership state".into())),
         }
     }
@@ -4132,8 +4148,19 @@ impl Db {
         community: CommunityId,
         command: &relay_members::ConditionalMembership<'_>,
     ) -> Result<(String, i64, bool)> {
+        self.conditional_membership_with_gate(community, command, false)
+            .await
+    }
+
+    /// Apply a conditional admission with an optional post-membership send gate.
+    pub async fn conditional_membership_with_gate(
+        &self,
+        community: CommunityId,
+        command: &relay_members::ConditionalMembership<'_>,
+        staged: bool,
+    ) -> Result<(String, i64, bool)> {
         Ok(sqlx::query_as(
-            "SELECT outcome, revision, changed FROM mutate_relay_membership($1,$2,$3,$4,$5,$6,$7)",
+            "SELECT outcome, revision, changed FROM mutate_relay_membership_with_gate($1,$2,$3,$4,$5,$6,$7,$8)",
         )
         .bind(community.as_uuid())
         .bind(command.pubkey)
@@ -4142,8 +4169,32 @@ impl Db {
         .bind(command.kind)
         .bind(command.role)
         .bind(command.expected_revision)
+        .bind(staged)
         .fetch_one(&self.pool)
         .await?)
+    }
+
+    /// Release a staged member after the caller has durably committed local activation.
+    pub async fn release_relay_membership(
+        &self,
+        community: CommunityId,
+        pubkey: &str,
+        actor: &str,
+        operation_id: uuid::Uuid,
+        staged_operation_id: uuid::Uuid,
+        expected_revision: i64,
+    ) -> Result<String> {
+        Ok(
+            sqlx::query_scalar("SELECT release_relay_membership($1,$2,$3,$4,$5,$6)")
+                .bind(community.as_uuid())
+                .bind(pubkey)
+                .bind(actor)
+                .bind(operation_id)
+                .bind(staged_operation_id)
+                .bind(expected_revision)
+                .fetch_one(&self.pool)
+                .await?,
+        )
     }
 
     /// Claims relay membership via an invite and atomically persists the

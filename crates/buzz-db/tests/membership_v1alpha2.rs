@@ -66,6 +66,12 @@ async fn migration_receipts_concurrency_and_restart() {
         ("active".into(), 1)
     );
     assert_eq!(
+        db.authoritative_membership_state(community, &key)
+            .await
+            .unwrap(),
+        ("active".into(), 1, true, None)
+    );
+    assert_eq!(
         db.authoritative_membership(community, &historical)
             .await
             .unwrap(),
@@ -118,6 +124,74 @@ async fn migration_receipts_concurrency_and_restart() {
     assert_eq!(
         db.authoritative_membership(community, &key).await.unwrap(),
         ("revoked".into(), 2)
+    );
+    let staged_key = "77".repeat(32);
+    let staged_operation = Uuid::new_v4();
+    let staged_command = ConditionalMembership {
+        pubkey: &staged_key,
+        actor: &owner,
+        operation_id: staged_operation,
+        kind: 9030,
+        role: "member",
+        expected_revision: 0,
+    };
+    assert_eq!(
+        db.conditional_membership_with_gate(community, &staged_command, true)
+            .await
+            .unwrap(),
+        ("ok".into(), 1, true)
+    );
+    assert_eq!(
+        db.authoritative_membership_state(community, &staged_key)
+            .await
+            .unwrap(),
+        ("active".into(), 1, false, Some(staged_operation))
+    );
+    let release_operation = Uuid::new_v4();
+    assert_eq!(
+        db.release_relay_membership(
+            community,
+            &staged_key,
+            &owner,
+            release_operation,
+            staged_operation,
+            1,
+        )
+        .await
+        .unwrap(),
+        "ok"
+    );
+    assert_eq!(
+        db.release_relay_membership(
+            community,
+            &staged_key,
+            &owner,
+            release_operation,
+            Uuid::new_v4(),
+            1,
+        )
+        .await
+        .unwrap(),
+        "operation_conflict"
+    );
+    assert_eq!(
+        db.authoritative_membership_state(community, &staged_key)
+            .await
+            .unwrap(),
+        ("active".into(), 1, true, None)
+    );
+    assert_eq!(
+        db.release_relay_membership(
+            community,
+            &staged_key,
+            &owner,
+            release_operation,
+            staged_operation,
+            1,
+        )
+        .await
+        .unwrap(),
+        "ok"
     );
     // Absent removal creates a sticky tombstone; repeated removal is a no-op.
     cmd.pubkey = &historical;

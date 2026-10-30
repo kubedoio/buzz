@@ -127,9 +127,9 @@ pub async fn check_membership(
     }
     // A delayed primary read must not mint a fresh timestamp for an older observation.
     let evaluated_at = nostr::Timestamp::now().as_secs();
-    let (membership, revision) = state
+    let (membership, revision, send_enabled, staged_operation_id) = state
         .db
-        .authoritative_membership(tenant.community(), &req.pubkey)
+        .authoritative_membership_state(tenant.community(), &req.pubkey)
         .await
         .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "membership unavailable"))?;
     sign_response(
@@ -137,6 +137,8 @@ pub async fn check_membership(
         serde_json::json!({
             "request_id": req.request_id, "community_id": req.community_id, "pubkey": req.pubkey,
             "membership": membership, "membership_revision": revision,
+            "send_enabled": send_enabled,
+            "staged_operation_id": staged_operation_id,
             "evaluated_at": evaluated_at,
         }),
     )

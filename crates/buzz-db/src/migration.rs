@@ -562,7 +562,7 @@ mod tests {
         let mut migrations: Vec<_> = MIGRATOR.iter().collect();
         migrations.sort_by_key(|migration| migration.version);
 
-        assert_eq!(migrations.len(), 29);
+        assert_eq!(migrations.len(), 30);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(&*migrations[0].description, "initial schema");
         assert!(migrations[0]
@@ -964,6 +964,11 @@ mod tests {
         assert!(membership.contains("prior.kind <> k"));
         assert!(membership.contains("prior.role <> r"));
         assert!(membership.contains("prior.expected_revision <> expected"));
+        let staged_membership = migrations[29].sql.as_str();
+        assert!(staged_membership.contains("ADD COLUMN send_enabled BOOLEAN NOT NULL DEFAULT true"));
+        assert!(staged_membership.contains("mutate_relay_membership_with_gate"));
+        assert!(staged_membership.contains("release_relay_membership"));
+        assert!(desired_schema.contains("ADD COLUMN staged_operation_id UUID"));
     }
 
     #[test]
