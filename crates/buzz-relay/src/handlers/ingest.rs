@@ -622,11 +622,18 @@ pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
     )
 }
 
-/// Check channel membership: member OR open-visibility channel.
+/// Check channel write authorization: member OR open-visibility channel.
 ///
 /// `channel` is the request's already-fetched channel row, when the caller has
 /// one (E1 within-request threading; correctness ruling §4.8). Callers without
 /// a row pass `None` and the open-visibility fallback reads the DB directly.
+///
+/// Membership alone is not write authority: a `guest`-role member is a
+/// read-only participant (`buzz_core::channel::MemberRole::Guest`) and is
+/// denied even though the `channel_members` row is active. The role is read
+/// fresh from the DB on every event — no per-connection or cached permission
+/// survives a member→guest downgrade. `bot` is not part of the role
+/// hierarchy and keeps its standing grants.
 ///
 /// Returns `Ok(())` if allowed, `Err(reason)` if denied.
 pub(crate) async fn check_channel_membership(
@@ -640,7 +647,17 @@ pub(crate) async fn check_channel_membership(
         .is_member_cached(tenant.community(), ch_id, pubkey_bytes)
         .await
     {
-        Ok(true) => return Ok(()),
+        Ok(true) => {
+            let role = state
+                .db
+                .get_member_role(tenant.community(), ch_id, pubkey_bytes)
+                .await
+                .map_err(|e| format!("error: database error: {e}"))?;
+            if matches!(role.as_deref(), Some("guest")) {
+                return Err("restricted: guest members are read-only".to_string());
+            }
+            return Ok(());
+        }
         Ok(false) => {}
         Err(e) => return Err(format!("error: database error: {e}")),
     }
