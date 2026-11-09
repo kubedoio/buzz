@@ -16,6 +16,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: rustfmt
       - name: Disposable dependencies
         run: |
           test_db_password=$(openssl rand -hex 24)
@@ -44,4 +46,9 @@ jobs:
         run: cargo test -p buzz-test-client --test authoritative_membership -- --ignored --nocapture
       - name: Relay diagnostics
         if: failure()
-        run: tail -100 /tmp/membership-conformance-relay.log
+        run: |
+          if [ -f /tmp/membership-conformance-relay.log ]; then
+            tail -100 /tmp/membership-conformance-relay.log
+          else
+            echo "Relay log was not created."
+          fi
