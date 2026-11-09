@@ -2043,6 +2043,19 @@ async fn ingest_event_inner(
     // Command kinds are routed AFTER signature verification, timestamp check,
     // pubkey/auth match, and scope validation — never before.
     if buzz_core::kind::is_command_kind(kind_u32) {
+        // Channel-scoped command events must pass the same write-authority
+        // gate as every other channel write: this return path sits BEFORE the
+        // generic gate below, so a command handler that authorized by
+        // membership row presence would escape the guest read-only rule.
+        // Commands without an h tag (DM open, workflow trigger, approvals)
+        // are global and skip the gate, matching the skip-list semantics of
+        // the persistent-event gate further below.
+        if let Some(ch_id) = extract_channel_id(&event) {
+            let cmd_pubkey_bytes = auth.pubkey().to_bytes().to_vec();
+            check_channel_write_role(tenant.community(), state, ch_id, &cmd_pubkey_bytes, None)
+                .await
+                .map_err(IngestError::Rejected)?;
+        }
         return super::command_executor::handle_command(tenant, state, event, auth).await;
     }
 

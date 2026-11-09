@@ -1,7 +1,10 @@
 //! Regression tests for guest-role write authorization on channel-scoped
 //! writes: channel messages (kind:9 / KIND_STREAM_MESSAGE), channel metadata
 //! edits (kind:9002 topic/purpose), message edits (kind:40003 self-edit),
-//! and message deletes (kind:9005 self-delete).
+//! message deletes (kind:9005 self-delete), channel-scoped command events
+//! (kind:30620 workflow definitions, kind:41011 DM add-member), and the
+//! durable indirect write a workflow performs through its owner's standing
+//! authority (the send_message action sink posting a relay-signed kind:9).
 //!
 //! The relay's role model (`buzz_core::channel::MemberRole`) defines `Guest`
 //! as a read-only external participant: a guest holds an active
@@ -166,6 +169,108 @@ fn delete_event(keys: &Keys, channel_id: &str, target_id: &str) -> Event {
         ])
         .sign_with_keys(keys)
         .unwrap()
+}
+
+/// YAML body for a workflow definition with a single `send_message` step.
+/// `text` uniquely marks the message the workflow would post, so tests can
+/// assert on its presence/absence in the events table.
+fn workflow_send_message_yaml(name: &str, text: &str) -> String {
+    format!(
+        "name: {name}\n\
+         description: guest-write-denial regression probe\n\
+         trigger:\n\
+         \x20 on: webhook\n\
+         steps:\n\
+         \x20 - id: step1\n\
+         \x20   name: Notify\n\
+         \x20   action: send_message\n\
+         \x20   text: \"{text}\"\n"
+    )
+}
+
+/// Sign a kind:30620 workflow definition for `workflow_id` in `channel_id`.
+fn workflow_def(keys: &Keys, channel_id: &str, workflow_id: &str, name: &str, text: &str) -> Event {
+    EventBuilder::new(Kind::Custom(30620), workflow_send_message_yaml(name, text))
+        .tags(vec![
+            Tag::parse(["h", channel_id]).unwrap(),
+            Tag::parse(["d", workflow_id]).unwrap(),
+            Tag::parse(["name", name]).unwrap(),
+        ])
+        .sign_with_keys(keys)
+        .unwrap()
+}
+
+/// Sign a kind:46020 manual workflow trigger for `workflow_id`.
+fn workflow_trigger(keys: &Keys, workflow_id: &str) -> Event {
+    EventBuilder::new(Kind::Custom(46020), "")
+        .tags(vec![Tag::parse(["d", workflow_id]).unwrap()])
+        .sign_with_keys(keys)
+        .unwrap()
+}
+
+/// Sign a kind:41010 DM open with `other` as the sole other participant.
+fn dm_open(keys: &Keys, other_pubkey_hex: &str) -> Event {
+    EventBuilder::new(Kind::Custom(41010), "")
+        .tags(vec![Tag::parse(["p", other_pubkey_hex]).unwrap()])
+        .sign_with_keys(keys)
+        .unwrap()
+}
+
+/// Sign a kind:41011 DM add-member command.
+fn dm_add_member(keys: &Keys, channel_id: &str, new_member_hex: &str) -> Event {
+    EventBuilder::new(Kind::Custom(41011), "")
+        .tags(vec![
+            Tag::parse(["h", channel_id]).unwrap(),
+            Tag::parse(["p", new_member_hex]).unwrap(),
+        ])
+        .sign_with_keys(keys)
+        .unwrap()
+}
+
+/// Parse a command `response:{"channel_id":"…"}` OK message into the channel id.
+fn parse_response_channel_id(message: &str, what: &str) -> String {
+    let json_part = message
+        .strip_prefix("response:")
+        .unwrap_or_else(|| panic!("{what} OK message missing `response:` prefix: {message:?}"));
+    let resp: serde_json::Value = serde_json::from_str(json_part)
+        .unwrap_or_else(|e| panic!("parse {what} response json: {e} ({json_part:?})"));
+    resp["channel_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{what} response missing channel_id: {resp}"))
+        .to_string()
+}
+
+/// Poll the events table until a kind:9 carrying exactly `text` in
+/// `channel_id` appears, or the timeout elapses. Returns whether it appeared.
+async fn wait_for_channel_message(
+    pool: &sqlx::Pool<sqlx::Postgres>,
+    community_id: uuid::Uuid,
+    channel_id: &str,
+    text: &str,
+    timeout: std::time::Duration,
+) -> bool {
+    let channel_uuid = uuid::Uuid::parse_str(channel_id).expect("channel UUID");
+    let start = std::time::Instant::now();
+    loop {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events \
+             WHERE community_id = $1 AND channel_id = $2 AND kind = 9 \
+               AND content = $3 AND deleted_at IS NULL",
+        )
+        .bind(community_id)
+        .bind(channel_uuid)
+        .bind(text)
+        .fetch_one(pool)
+        .await
+        .expect("count workflow-posted kind:9 rows");
+        if count > 0 {
+            return true;
+        }
+        if start.elapsed() > timeout {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
 }
 
 /// A guest-role identity must not be able to post a kind:9 message,
@@ -898,4 +1003,364 @@ async fn test_removed_member_denied_immediately_private_channel() {
 
     owner.disconnect().await.expect("disconnect owner");
     member.disconnect().await.expect("disconnect member");
+}
+
+/// A guest must not be able to define a channel-scoped workflow (kind:30620):
+/// command events return before the persistent-event write gate, so the
+/// command path enforces the shared gate itself. A guest-defined workflow
+/// would be a durable indirect write — its actions execute with the owner's
+/// standing authority long after the defining event.
+#[tokio::test]
+#[ignore]
+async fn test_guest_cannot_define_workflow() {
+    let url = relay_url();
+    let community_id = ensure_test_community().await;
+    let owner_keys = Keys::generate();
+    let guest_keys = Keys::generate();
+
+    let mut owner = buzz_test_client::BuzzTestClient::connect(&url, &owner_keys)
+        .await
+        .expect("connect as owner");
+    let channel_id = create_channel_ws(&mut owner, &owner_keys, "private").await;
+
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &guest_keys.public_key().to_hex(),
+        Some("guest"),
+        &owner_keys,
+    )
+    .await;
+    assert!(accepted, "owner should add guest, got: {msg}");
+
+    let workflow_id = uuid::Uuid::new_v4().to_string();
+    let marker = format!("guest-wf-def-probe-{}", uuid::Uuid::new_v4());
+    let mut guest = buzz_test_client::BuzzTestClient::connect(&url, &guest_keys)
+        .await
+        .expect("connect as guest");
+    let ok = guest
+        .send_event(workflow_def(
+            &guest_keys,
+            &channel_id,
+            &workflow_id,
+            "guest-def",
+            &marker,
+        ))
+        .await
+        .expect("guest kind:30620 publish");
+    assert!(
+        !ok.accepted,
+        "guest kind:30620 workflow definition must be rejected, but it was accepted: {}",
+        ok.message
+    );
+    assert!(
+        ok.message.contains("guest") || ok.message.contains("read-only"),
+        "rejection should name the guest read-only restriction, got: {}",
+        ok.message
+    );
+
+    // Belt and braces: even if a definition somehow landed, its workflow must
+    // not be able to post into the channel.
+    let pool = e2e_db_pool().await;
+    let appeared = wait_for_channel_message(
+        &pool,
+        community_id,
+        &channel_id,
+        &marker,
+        std::time::Duration::from_secs(3),
+    )
+    .await;
+    assert!(
+        !appeared,
+        "no workflow message may land in the channel from a guest definition"
+    );
+
+    // Control: the owner's own definition in the same channel is accepted.
+    let workflow_id = uuid::Uuid::new_v4().to_string();
+    let ok = owner
+        .send_event(workflow_def(
+            &owner_keys,
+            &channel_id,
+            &workflow_id,
+            "owner-def",
+            &format!("owner-wf-def-probe-{}", uuid::Uuid::new_v4()),
+        ))
+        .await
+        .expect("owner kind:30620 publish");
+    assert!(
+        ok.accepted,
+        "owner kind:30620 workflow definition must be accepted: {}",
+        ok.message
+    );
+
+    owner.disconnect().await.expect("disconnect owner");
+    guest.disconnect().await.expect("disconnect guest");
+}
+
+/// A workflow owned by an identity that was downgraded to guest must not run:
+/// manual triggers re-check the owner's CURRENT role, and a guest is
+/// read-only. Most importantly, the workflow's send_message action sink must
+/// not persist a relay-signed kind:9 with the guest's standing authority.
+#[tokio::test]
+#[ignore]
+async fn test_guest_triggered_workflow_cannot_post_channel_message() {
+    let url = relay_url();
+    let community_id = ensure_test_community().await;
+    let owner_keys = Keys::generate();
+    let member_keys = Keys::generate();
+
+    let mut owner = buzz_test_client::BuzzTestClient::connect(&url, &owner_keys)
+        .await
+        .expect("connect as owner");
+    let channel_id = create_channel_ws(&mut owner, &owner_keys, "private").await;
+
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &member_keys.public_key().to_hex(),
+        Some("member"),
+        &owner_keys,
+    )
+    .await;
+    assert!(accepted, "owner should add member, got: {msg}");
+
+    // The member defines a workflow whose single action posts a marked
+    // kind:9 into the channel.
+    let workflow_id = uuid::Uuid::new_v4().to_string();
+    let marker = format!("guest-wf-run-probe-{}", uuid::Uuid::new_v4());
+    let mut member = buzz_test_client::BuzzTestClient::connect(&url, &member_keys)
+        .await
+        .expect("connect as member");
+    let ok = member
+        .send_event(workflow_def(
+            &member_keys,
+            &channel_id,
+            &workflow_id,
+            "member-def",
+            &marker,
+        ))
+        .await
+        .expect("member kind:30620 publish");
+    assert!(
+        ok.accepted,
+        "member kind:30620 workflow definition must be accepted: {}",
+        ok.message
+    );
+
+    // Owner downgrades the workflow owner to guest on the wire.
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &member_keys.public_key().to_hex(),
+        Some("guest"),
+        &owner_keys,
+    )
+    .await;
+    assert!(
+        accepted,
+        "owner should downgrade member to guest, got: {msg}"
+    );
+
+    // The guest's manual trigger must be denied: the owner's current role no
+    // longer authorizes running the workflow.
+    let ok = member
+        .send_event(workflow_trigger(&member_keys, &workflow_id))
+        .await
+        .expect("guest kind:46020 trigger");
+    assert!(
+        !ok.accepted,
+        "guest-owned workflow trigger must be rejected after member→guest downgrade: {}",
+        ok.message
+    );
+
+    // The critical assertion: no kind:9 produced by the workflow may land in
+    // the channel, however the trigger door was denied.
+    let pool = e2e_db_pool().await;
+    let appeared = wait_for_channel_message(
+        &pool,
+        community_id,
+        &channel_id,
+        &marker,
+        std::time::Duration::from_secs(5),
+    )
+    .await;
+    assert!(
+        !appeared,
+        "a guest-owned workflow must not post a kind:9 into the channel"
+    );
+
+    owner.disconnect().await.expect("disconnect owner");
+    member.disconnect().await.expect("disconnect member");
+}
+
+/// Positive control: a member-owned workflow still defines, triggers, and
+/// posts its kind:9 — the guest fixes must not break legitimate workflows.
+#[tokio::test]
+#[ignore]
+async fn test_member_workflow_still_posts_channel_message() {
+    let url = relay_url();
+    let community_id = ensure_test_community().await;
+    let owner_keys = Keys::generate();
+    let member_keys = Keys::generate();
+
+    let mut owner = buzz_test_client::BuzzTestClient::connect(&url, &owner_keys)
+        .await
+        .expect("connect as owner");
+    let channel_id = create_channel_ws(&mut owner, &owner_keys, "private").await;
+
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &member_keys.public_key().to_hex(),
+        Some("member"),
+        &owner_keys,
+    )
+    .await;
+    assert!(accepted, "owner should add member, got: {msg}");
+
+    let workflow_id = uuid::Uuid::new_v4().to_string();
+    let marker = format!("member-wf-run-probe-{}", uuid::Uuid::new_v4());
+    let mut member = buzz_test_client::BuzzTestClient::connect(&url, &member_keys)
+        .await
+        .expect("connect as member");
+    let ok = member
+        .send_event(workflow_def(
+            &member_keys,
+            &channel_id,
+            &workflow_id,
+            "member-def",
+            &marker,
+        ))
+        .await
+        .expect("member kind:30620 publish");
+    assert!(
+        ok.accepted,
+        "member kind:30620 workflow definition must be accepted: {}",
+        ok.message
+    );
+
+    let ok = member
+        .send_event(workflow_trigger(&member_keys, &workflow_id))
+        .await
+        .expect("member kind:46020 trigger");
+    assert!(
+        ok.accepted,
+        "member-owned workflow trigger must be accepted: {}",
+        ok.message
+    );
+
+    // The workflow runs asynchronously; its kind:9 must land in the channel.
+    let pool = e2e_db_pool().await;
+    let appeared = wait_for_channel_message(
+        &pool,
+        community_id,
+        &channel_id,
+        &marker,
+        std::time::Duration::from_secs(15),
+    )
+    .await;
+    assert!(
+        appeared,
+        "member-owned workflow must post its kind:9 into the channel"
+    );
+
+    owner.disconnect().await.expect("disconnect owner");
+    member.disconnect().await.expect("disconnect member");
+}
+
+/// Channel-scoped command events obey the shared gate: a guest's DM
+/// add-member (kind:41011) is denied even where the legacy presence check
+/// would have passed, while a member's DM add-member keeps working (DM
+/// participants always hold the `member` role, so DM flows are unaffected).
+#[tokio::test]
+#[ignore]
+async fn test_guest_channel_command_denied_member_dm_command_allowed() {
+    let url = relay_url();
+    ensure_test_community().await;
+    let owner_keys = Keys::generate();
+    let member_keys = Keys::generate();
+    let guest_keys = Keys::generate();
+    let third_keys = Keys::generate();
+
+    let mut owner = buzz_test_client::BuzzTestClient::connect(&url, &owner_keys)
+        .await
+        .expect("connect as owner");
+    let channel_id = create_channel_ws(&mut owner, &owner_keys, "private").await;
+
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &member_keys.public_key().to_hex(),
+        Some("member"),
+        &owner_keys,
+    )
+    .await;
+    assert!(accepted, "owner should add member, got: {msg}");
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &guest_keys.public_key().to_hex(),
+        Some("guest"),
+        &owner_keys,
+    )
+    .await;
+    assert!(accepted, "owner should add guest, got: {msg}");
+
+    // The member opens a DM with the owner and learns the DM channel id.
+    let mut member = buzz_test_client::BuzzTestClient::connect(&url, &member_keys)
+        .await
+        .expect("connect as member");
+    let ok = member
+        .send_event(dm_open(&member_keys, &owner_keys.public_key().to_hex()))
+        .await
+        .expect("member kind:41010 DM open");
+    assert!(
+        ok.accepted,
+        "member DM open must be accepted: {}",
+        ok.message
+    );
+    let dm_channel_id = parse_response_channel_id(&ok.message, "DM open");
+
+    // Guest's channel-scoped command is denied by the write gate — even
+    // though the legacy handler would have seen an active membership row.
+    let mut guest = buzz_test_client::BuzzTestClient::connect(&url, &guest_keys)
+        .await
+        .expect("connect as guest");
+    let ok = guest
+        .send_event(dm_add_member(
+            &guest_keys,
+            &channel_id,
+            &third_keys.public_key().to_hex(),
+        ))
+        .await
+        .expect("guest kind:41011 publish");
+    assert!(
+        !ok.accepted,
+        "guest kind:41011 channel command must be rejected: {}",
+        ok.message
+    );
+    assert!(
+        ok.message.contains("guest") || ok.message.contains("read-only"),
+        "rejection should name the guest read-only restriction, got: {}",
+        ok.message
+    );
+
+    // Member's DM add-member still works: DM participants hold `member`.
+    let ok = member
+        .send_event(dm_add_member(
+            &member_keys,
+            &dm_channel_id,
+            &third_keys.public_key().to_hex(),
+        ))
+        .await
+        .expect("member kind:41011 publish");
+    assert!(
+        ok.accepted,
+        "member kind:41011 DM add-member must be accepted: {}",
+        ok.message
+    );
+
+    owner.disconnect().await.expect("disconnect owner");
+    member.disconnect().await.expect("disconnect member");
+    guest.disconnect().await.expect("disconnect guest");
 }

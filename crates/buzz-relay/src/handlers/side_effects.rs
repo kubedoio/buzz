@@ -1961,6 +1961,10 @@ async fn handle_join_request(
 
     // Skip if already an active member — prevents duplicate join notifications.
     // Fail closed on DB errors rather than falling through to add_member.
+    // A stale cached `false` here is benign: add_member is idempotent and its
+    // active-role-change guard rejects re-adding an existing member under a
+    // different role without an elevated granter, so no privilege change can
+    // ride on a cache miss.
     if state
         .is_member_cached(tenant.community(), channel_id, &actor_bytes)
         .await?
