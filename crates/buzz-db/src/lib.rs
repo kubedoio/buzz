@@ -4091,13 +4091,16 @@ impl Db {
         relay_members::add_relay_member(&self.pool, community, pubkey, role, added_by).await
     }
 
-    /// Whether this community rejects legacy membership writers.
+    /// Whether this community rejects legacy membership writers. A community
+    /// without a row cannot have opted in — the column default is `false` —
+    /// so a missing row answers `false`; only a real database error fails.
     pub async fn membership_v1alpha2(&self, community: CommunityId) -> Result<bool> {
         Ok(
             sqlx::query_scalar("SELECT membership_v1alpha2 FROM communities WHERE id = $1")
                 .bind(community.as_uuid())
-                .fetch_one(&self.pool)
-                .await?,
+                .fetch_optional(&self.pool)
+                .await?
+                .unwrap_or(false),
         )
     }
 
