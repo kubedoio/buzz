@@ -4091,6 +4091,61 @@ impl Db {
         relay_members::add_relay_member(&self.pool, community, pubkey, role, added_by).await
     }
 
+    /// Whether this community rejects legacy membership writers.
+    pub async fn membership_v1alpha2(&self, community: CommunityId) -> Result<bool> {
+        Ok(
+            sqlx::query_scalar("SELECT membership_v1alpha2 FROM communities WHERE id = $1")
+                .bind(community.as_uuid())
+                .fetch_one(&self.pool)
+                .await?,
+        )
+    }
+
+    /// Read membership and its durable revision in one primary-database snapshot.
+    /// Inconsistent state is unavailable, never an absence decision.
+    pub async fn authoritative_membership(
+        &self,
+        community: CommunityId,
+        pubkey: &str,
+    ) -> Result<(String, i64)> {
+        let (active, revision, revoked): (bool, Option<i64>, Option<bool>) = sqlx::query_as(
+            "SELECT EXISTS(SELECT 1 FROM relay_members WHERE community_id = $1 AND pubkey = $2), \
+             s.revision, s.revoked FROM (SELECT 1) seed LEFT JOIN relay_membership_state s \
+             ON s.community_id = $1 AND s.pubkey = $2",
+        )
+        .bind(community.as_uuid())
+        .bind(pubkey)
+        .fetch_one(&self.pool)
+        .await?;
+        match (active, revision, revoked) {
+            (true, Some(r), Some(false)) if r > 0 => Ok(("active".into(), r)),
+            (false, Some(r), Some(true)) if r > 0 => Ok(("revoked".into(), r)),
+            (false, None | Some(0), None | Some(false)) => Ok(("absent".into(), 0)),
+            _ => Err(DbError::InvalidData("inconsistent membership state".into())),
+        }
+    }
+
+    /// Apply a conditional NIP-43 command and durably record its outcome.
+    /// The primary database serializes authorization, revisions and receipts.
+    pub async fn conditional_membership(
+        &self,
+        community: CommunityId,
+        command: &relay_members::ConditionalMembership<'_>,
+    ) -> Result<(String, i64, bool)> {
+        Ok(sqlx::query_as(
+            "SELECT outcome, revision, changed FROM mutate_relay_membership($1,$2,$3,$4,$5,$6,$7)",
+        )
+        .bind(community.as_uuid())
+        .bind(command.pubkey)
+        .bind(command.actor)
+        .bind(command.operation_id)
+        .bind(command.kind)
+        .bind(command.role)
+        .bind(command.expected_revision)
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     /// Claims relay membership via an invite and atomically persists the
     /// accepted policy version when a policy is configured.
     pub async fn claim_relay_membership(

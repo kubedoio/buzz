@@ -12,6 +12,22 @@ use sqlx::{PgPool, Row as _};
 use crate::error::Result;
 use crate::CommunityId;
 
+/// Validated conditional NIP-43 command for an opted-in community.
+pub struct ConditionalMembership<'a> {
+    /// Exact target key.
+    pub pubkey: &'a str,
+    /// Authenticated event signer.
+    pub actor: &'a str,
+    /// Stable mutation identifier.
+    pub operation_id: uuid::Uuid,
+    /// NIP-43 add or remove kind.
+    pub kind: i32,
+    /// Requested add role (member for removals).
+    pub role: &'a str,
+    /// Revision observed by the caller.
+    pub expected_revision: i64,
+}
+
 /// A single relay member record.
 #[derive(Debug, Clone)]
 pub struct RelayMember {

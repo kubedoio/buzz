@@ -308,6 +308,82 @@ async fn execute_relay_admin_command(
         .ok_or_else(|| "missing or invalid p tag".to_string())?
         .to_ascii_lowercase();
 
+    if (kind == RELAY_ADMIN_ADD_MEMBER || kind == RELAY_ADMIN_REMOVE_MEMBER)
+        && state
+            .db
+            .membership_v1alpha2(tenant.community())
+            .await
+            .map_err(|e| e.to_string())?
+    {
+        // Reject duplicate/ambiguous signed tags rather than selecting one.
+        let single = |name: &str| -> Result<String, String> {
+            let tags: Vec<_> = event
+                .tags
+                .iter()
+                .filter(|t| t.as_slice()[0] == name)
+                .collect();
+            if tags.len() != 1 || tags[0].as_slice().len() != 2 {
+                return Err(format!("exactly one {name} tag required"));
+            }
+            Ok(tags[0].as_slice()[1].clone())
+        };
+        let operation_id = single("elembra-op")?
+            .parse::<uuid::Uuid>()
+            .map_err(|_| "invalid operation ID")?;
+        if single("p")? != target_hex {
+            return Err("noncanonical membership target".into());
+        }
+        if event
+            .tags
+            .iter()
+            .filter(|t| t.as_slice()[0] == "role")
+            .count()
+            > 1
+        {
+            return Err("ambiguous membership role".into());
+        }
+        let expected_revision = single("elembra-expected-revision")?
+            .parse::<i64>()
+            .map_err(|_| "invalid revision")?;
+        let role = if kind == RELAY_ADMIN_ADD_MEMBER {
+            extract_tag_value(event, "role").unwrap_or_else(|| "member".into())
+        } else {
+            "member".into()
+        };
+        let (outcome, _, changed) = state
+            .db
+            .conditional_membership(
+                tenant.community(),
+                &buzz_db::relay_members::ConditionalMembership {
+                    pubkey: &target_hex,
+                    actor: &sender_hex,
+                    operation_id,
+                    kind: kind as i32,
+                    role: &role,
+                    expected_revision,
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if outcome != "ok" {
+            return Err(format!("membership: {outcome}"));
+        }
+        if changed {
+            let result = if kind == RELAY_ADMIN_ADD_MEMBER {
+                publish_nip43_member_added(tenant, state, &target_hex).await
+            } else {
+                publish_nip43_member_removed(tenant, state, &target_hex).await
+            };
+            if let Err(e) = result {
+                warn!(error = %e, "membership announcement failed");
+            }
+            if let Err(e) = publish_nip43_membership_list(tenant, state).await {
+                warn!(error = %e, "membership roster publication failed");
+            }
+        }
+        return Ok(());
+    }
+
     match kind {
         // kind:9030 — Add relay member
         k if k == RELAY_ADMIN_ADD_MEMBER => {
