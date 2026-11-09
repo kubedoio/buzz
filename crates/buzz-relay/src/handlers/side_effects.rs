@@ -364,7 +364,7 @@ pub async fn validate_admin_event(
             //
             // A self-targeted add skips this check so an idempotent re-add
             // still works. That is not a way into a private channel: ingest's
-            // `check_channel_membership` rejects a non-member (and a
+            // `check_channel_write_role` rejects a non-member (and a
             // soft-removed member) before this validator runs, and `add_member`
             // independently requires the self-inviter to hold an active role.
             // Self-promotion is caught by the role-change guard below.
@@ -617,15 +617,18 @@ pub async fn validate_admin_event(
                     }
                 }
             } else {
-                // topic/purpose: any member
-                let is_member = state
-                    .is_member_cached(tenant.community(), channel_id, &actor_bytes)
-                    .await?;
-                if is_member {
-                    Ok(())
-                } else {
-                    Err(anyhow::anyhow!("not a member"))
-                }
+                // topic/purpose: any non-guest member. The shared write gate
+                // is the authority — guests are read-only, and non-members
+                // keep the documented open-channel write fallback.
+                super::ingest::check_channel_write_role(
+                    tenant.community(),
+                    state,
+                    channel_id,
+                    &actor_bytes,
+                    Some(&channel),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))
             }
         }
         9005 => {
@@ -674,24 +677,31 @@ pub async fn validate_admin_event(
             let author =
                 effective_message_author(&target_event.event, &state.relay_keypair.public_key());
             if author_delete_can_use_self_delete_path(&author, &actor_bytes, event) {
-                // Author deleting their own message: re-gate on membership/open visibility so that
-                // a removed private-channel member cannot mutate old messages after access is revoked.
-                let is_member = state
-                    .is_member_cached(tenant.community(), channel_id, &actor_bytes)
-                    .await?;
-                if is_member {
-                    return Ok(());
+                // Author deleting their own message: re-gate through the
+                // shared write-role check so a guest member cannot self-delete
+                // and a just-removed private-channel member loses the ability
+                // immediately (no cache window). A denial here falls through
+                // to the owner/admin / owner-of-agent check below.
+                match super::ingest::check_channel_write_role(
+                    tenant.community(),
+                    state,
+                    channel_id,
+                    &actor_bytes,
+                    Some(&channel),
+                )
+                .await
+                {
+                    Ok(()) => return Ok(()),
+                    // Fail closed on a DB error, as the old membership probe did.
+                    Err(msg) if msg.starts_with("error:") => {
+                        return Err(anyhow::anyhow!("{msg}"));
+                    }
+                    // Role-gate denial (guest / removed on private) — the
+                    // owner/admin / owner-of-agent path below may still apply.
+                    Err(_) => {}
                 }
-                let is_open = state
-                    .db
-                    .get_channel(tenant.community(), channel_id)
-                    .await
-                    .map(|ch| ch.visibility == "open")
-                    .unwrap_or(false);
-                if is_open {
-                    return Ok(());
-                }
-                // Not a member and channel is private — fall through to owner/admin/owner-of-agent check.
+                // Not authorized by membership/open-visibility — fall through
+                // to the owner/admin/owner-of-agent check.
             }
 
             // Not the author, or author who is no longer a member of a private channel —

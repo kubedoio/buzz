@@ -24,7 +24,7 @@
 //!
 //! ## Wire points
 //!
-//! - **ingest.rs:** AuthCheck at `check_channel_membership` call site;
+//! - **ingest.rs:** AuthCheck at `check_channel_write_role` call site;
 //!   WriteInsert / WriteInsertGlobal / WriteDuplicate at the two
 //!   `dispatch_persistent_event` sites; SanitizedError at the outer
 //!   wrapper based on the IngestError variant.

@@ -622,59 +622,68 @@ pub(crate) fn requires_h_channel_scope(kind: u32) -> bool {
     )
 }
 
-/// Check channel write authorization: member OR open-visibility channel.
+/// Check channel write authorization: an active member holding any role
+/// except `guest`, or a non-member writing to an open-visibility channel.
 ///
 /// `channel` is the request's already-fetched channel row, when the caller has
 /// one (E1 within-request threading; correctness ruling §4.8). Callers without
 /// a row pass `None` and the open-visibility fallback reads the DB directly.
 ///
+/// This is the single write-authority rule for channel-scoped events: the
+/// generic ingest gate and every per-kind re-gate (kind:9002 topic/purpose,
+/// kind:40003 self-edit, kind:9005 self-delete) delegate here so the rule
+/// lives in one place.
+///
 /// Membership alone is not write authority: a `guest`-role member is a
 /// read-only participant (`buzz_core::channel::MemberRole::Guest`) and is
-/// denied even though the `channel_members` row is active. The role is read
-/// fresh from the DB on every event — no per-connection or cached permission
-/// survives a member→guest downgrade. `bot` is not part of the role
-/// hierarchy and keeps its standing grants.
+/// denied even though the `channel_members` row is active. The decision is
+/// made from the role read FRESH from the DB on every event
+/// (`get_member_role`, `removed_at IS NULL`) — never from the membership
+/// cache:
+/// - no per-connection or cached permission survives a member→guest downgrade;
+/// - a just-removed member reads `None` and is denied on private channels
+///   immediately, without waiting out the 10s moka TTL or the
+///   fire-and-forget cross-pod invalidation (the cache stays load-bearing
+///   for the REQ/read paths, but the write gate must not fail open from it).
+///
+/// `bot` is not part of the role hierarchy and keeps its standing grants.
 ///
 /// Returns `Ok(())` if allowed, `Err(reason)` if denied.
-pub(crate) async fn check_channel_membership(
-    tenant: &TenantContext,
+pub(crate) async fn check_channel_write_role(
+    community_id: CommunityId,
     state: &AppState,
     ch_id: Uuid,
     pubkey_bytes: &[u8],
     channel: Option<&buzz_db::channel::ChannelRecord>,
 ) -> Result<(), String> {
-    match state
-        .is_member_cached(tenant.community(), ch_id, pubkey_bytes)
+    let role = state
+        .db
+        .get_member_role(community_id, ch_id, pubkey_bytes)
         .await
-    {
-        Ok(true) => {
-            let role = state
-                .db
-                .get_member_role(tenant.community(), ch_id, pubkey_bytes)
-                .await
-                .map_err(|e| format!("error: database error: {e}"))?;
-            if matches!(role.as_deref(), Some("guest")) {
-                return Err("restricted: guest members are read-only".to_string());
+        .map_err(|e| format!("error: database error: {e}"))?;
+    match role.as_deref() {
+        // Guest is a read-only participant — deny even with an active row.
+        Some("guest") => Err("restricted: guest members are read-only".to_string()),
+        // Any other active role (owner/admin/member/bot) may write.
+        Some(_) => Ok(()),
+        // No active row: open channels are writable by non-members (NOSTR.md);
+        // private channels deny.
+        None => {
+            let is_open = match channel {
+                Some(ch) => ch.visibility == "open",
+                None => state
+                    .db
+                    .get_channel(community_id, ch_id)
+                    .await
+                    .map(|ch| ch.visibility == "open")
+                    .unwrap_or(false),
+            };
+            if is_open {
+                Ok(())
+            } else {
+                Err("restricted: not a channel member".to_string())
             }
-            return Ok(());
         }
-        Ok(false) => {}
-        Err(e) => return Err(format!("error: database error: {e}")),
-    }
-    // Not a member — check if channel is open.
-    let is_open = match channel {
-        Some(ch) => ch.visibility == "open",
-        None => state
-            .db
-            .get_channel(tenant.community(), ch_id)
-            .await
-            .map(|ch| ch.visibility == "open")
-            .unwrap_or(false),
-    };
-    if is_open {
-        Ok(())
-    } else {
-        Err("restricted: not a channel member".to_string())
     }
 }
 
@@ -963,24 +972,13 @@ async fn validate_edit_ownership(
     let author = effective_message_author(&target_event.event, &state.relay_keypair.public_key());
     let actor = event.pubkey.to_bytes().to_vec();
     if author == actor {
-        // Author editing their own message: re-gate on membership/open visibility so that
-        // a removed private-channel member cannot mutate old messages after access is revoked.
+        // Author editing their own message: re-gate through the shared
+        // write-role check so a guest member cannot self-edit and a removed
+        // private-channel member cannot mutate old messages after access is
+        // revoked. No channel row threaded here — the open fallback reads
+        // the DB directly.
         if let Some(ch_id) = target_event.channel_id {
-            let is_member = state
-                .is_member_cached(community_id, ch_id, &actor)
-                .await
-                .map_err(|e| format!("db error checking membership: {e}"))?;
-            if !is_member {
-                let is_open = state
-                    .db
-                    .get_channel(community_id, ch_id)
-                    .await
-                    .map(|ch| ch.visibility == "open")
-                    .unwrap_or(false);
-                if !is_open {
-                    return Err("restricted: not a channel member".to_string());
-                }
-            }
+            check_channel_write_role(community_id, state, ch_id, &actor, None).await?;
         }
     } else {
         // Allow the owning human to edit messages authored by their agent.
@@ -2295,12 +2293,17 @@ async fn ingest_event_inner(
             // (recorded separately to bite M2 / M8 — claim or A-host
             // driving a B-channel verdict — at the checker). The verdict
             // basis is `tenant.community()` server-resolved, confirmed
-            // at `check_channel_membership`'s `is_member_cached(tenant
-            // .community(), …)` call (see crates/buzz-relay/src/handlers
+            // at `check_channel_write_role`'s fresh `get_member_role(tenant
+            // .community(), …)` read (see crates/buzz-relay/src/handlers
             // /ingest.rs:424).
-            let auth_result =
-                check_channel_membership(tenant, state, ch_id, &pubkey_bytes, channel_row.as_ref())
-                    .await;
+            let auth_result = check_channel_write_role(
+                tenant.community(),
+                state,
+                ch_id,
+                &pubkey_bytes,
+                channel_row.as_ref(),
+            )
+            .await;
             let claimed = claimed_community_from_event(&event);
             let verdict = if auth_result.is_ok() {
                 Verdict::Allow
