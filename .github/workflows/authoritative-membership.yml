@@ -22,7 +22,9 @@ jobs:
         run: |
           test_db_password=$(openssl rand -hex 24)
           echo "::add-mask::${test_db_password}"
-          echo "BUZZ_TEST_DATABASE_URL=postgres://buzz:${test_db_password}@127.0.0.1:55442/buzz" >> "$GITHUB_ENV"
+          test_database_url="postgres://buzz:${test_db_password}@127.0.0.1:55442/buzz"
+          echo "BUZZ_TEST_DATABASE_URL=${test_database_url}" >> "$GITHUB_ENV"
+          echo "DATABASE_URL=${test_database_url}" >> "$GITHUB_ENV"
           docker run -d --name m41-buzz-postgres -e POSTGRES_USER=buzz -e POSTGRES_PASSWORD="${test_db_password}" -e POSTGRES_DB=buzz -p 127.0.0.1:55442:5432 postgres:16
           docker run -d --name m41-buzz-redis -p 127.0.0.1:56442:6379 redis:7-alpine
           for attempt in $(seq 1 30); do
@@ -34,6 +36,7 @@ jobs:
         run: |
           cargo fmt --all --check
           cargo build -p buzz-relay
+          cargo run -p buzz-admin -- migrate
           cargo clippy -p buzz-db -p buzz-relay -p buzz-test-client --all-targets -- -D warnings
           cargo test -p buzz-db -p buzz-relay -p buzz-test-client --lib
       - name: Migration and PostgreSQL contract
