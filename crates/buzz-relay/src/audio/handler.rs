@@ -664,7 +664,16 @@ async fn handle_active_audio_connection(
     let (ctrl_tx, ctrl_rx) = mpsc::channel::<WsMessage>(8);
 
     let send_cancel = cancel.child_token();
-    let send_task = tokio::spawn(send_loop(ws_send, data_rx, ctrl_rx, send_cancel));
+    let send_task = tokio::spawn(send_loop(
+        ws_send,
+        data_rx,
+        ctrl_rx,
+        send_cancel,
+        Arc::clone(&state),
+        tenant.community(),
+        channel_id,
+        pubkey,
+    ));
 
     let hb_cancel = cancel.clone();
     let hb_missed = Arc::clone(&missed_pongs);
@@ -781,6 +790,10 @@ async fn handle_active_audio_connection(
         ctrl_tx,
         Arc::clone(&missed_pongs),
         cancel.clone(),
+        Arc::clone(&state),
+        tenant.community(),
+        channel_id,
+        pubkey,
         remote_session.as_mut(),
     )
     .await;
@@ -956,6 +969,10 @@ async fn recv_loop(
     ctrl_tx: mpsc::Sender<WsMessage>,
     missed_pongs: Arc<AtomicU8>,
     cancel: CancellationToken,
+    state: Arc<AppState>,
+    community: buzz_core::CommunityId,
+    channel_id: Uuid,
+    pubkey: nostr::PublicKey,
     mut remote_session: Option<&mut crate::audio::join::RemoteHuddleSession>,
 ) {
     use crate::audio::wire::{FrameHeader, V2_HEADER_LEN};
@@ -967,6 +984,21 @@ async fn recv_loop(
             msg = ws_recv.next() => {
                 match msg {
                     Some(Ok(WsMessage::Binary(data))) => {
+                        // Speaking is a channel write: re-read the role fresh on
+                        // every frame so a mid-session member→guest downgrade is
+                        // cut without waiting for disconnect (mirrors mainline
+                        // audio_membership_allowed, minus its v1alpha2 half).
+                        if !audio_membership_allowed(
+                            &state,
+                            community,
+                            channel_id,
+                            &pubkey,
+                            &cancel,
+                        )
+                        .await
+                        {
+                            break;
+                        }
                         if data.len() > MAX_AUDIO_FRAME_BYTES {
                             warn!(peer_id = %peer_id, bytes = data.len(), "audio frame too large — dropping");
                             continue;
@@ -1060,15 +1092,23 @@ async fn recv_loop(
 ///
 /// Control frames (Ping, Pong, Close, control JSON) are drained first on every
 /// iteration, so heartbeat pings are never starved by audio backpressure.
+#[allow(clippy::too_many_arguments)]
 async fn send_loop(
     mut ws_send: futures_util::stream::SplitSink<WebSocket, WsMessage>,
     mut data_rx: mpsc::Receiver<WsMessage>,
     mut ctrl_rx: mpsc::Receiver<WsMessage>,
     cancel: CancellationToken,
+    state: Arc<AppState>,
+    community: buzz_core::CommunityId,
+    channel_id: Uuid,
+    pubkey: nostr::PublicKey,
 ) {
     loop {
         // Priority: drain all pending control frames before data.
         while let Ok(ctrl_msg) = ctrl_rx.try_recv() {
+            if !audio_membership_allowed(&state, community, channel_id, &pubkey, &cancel).await {
+                return;
+            }
             if ws_send.send(ctrl_msg).await.is_err() {
                 return;
             }
@@ -1081,9 +1121,11 @@ async fn send_loop(
                 break;
             }
             Some(ctrl_msg) = ctrl_rx.recv() => {
+                if !audio_membership_allowed(&state, community, channel_id, &pubkey, &cancel).await { break; }
                 if ws_send.send(ctrl_msg).await.is_err() { break; }
             }
             Some(msg) = data_rx.recv() => {
+                if !audio_membership_allowed(&state, community, channel_id, &pubkey, &cancel).await { break; }
                 if ws_send.send(msg).await.is_err() { break; }
             }
         }
@@ -1152,6 +1194,35 @@ async fn heartbeat_loop(
             _ = cancel.cancelled() => break,
         }
     }
+}
+
+/// Per-frame audio admission re-check, run by the send/recv loops. Speaking in
+/// a huddle is a channel write, so a member→guest downgrade must cut a live
+/// speaker without waiting for disconnect: the guest role is re-read fresh on
+/// every frame, and a probe failure cancels the connection. Backported from
+/// mainline PR #8 (9baddb7b); the mainline version's v1alpha2 authoritative-
+/// membership half does not exist on this line and is omitted. Admission-time
+/// probing (ensure_membership) is unchanged and stays the first line of defense.
+async fn audio_membership_allowed(
+    state: &AppState,
+    community: buzz_core::CommunityId,
+    channel_id: Uuid,
+    pubkey: &nostr::PublicKey,
+    cancel: &CancellationToken,
+) -> bool {
+    if crate::handlers::ingest::check_not_guest_identity(
+        community,
+        state,
+        Some(channel_id),
+        pubkey.as_bytes(),
+    )
+    .await
+    .is_err()
+    {
+        cancel.cancel();
+        return false;
+    }
+    true
 }
 
 async fn ensure_membership(

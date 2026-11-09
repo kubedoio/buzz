@@ -2285,3 +2285,118 @@ async fn test_guest_cannot_delete_group_via_owned_agent() {
         .await
         .expect("disconnect fallback human");
 }
+
+/// A member speaking in a huddle must be cut when its role is downgraded to
+/// guest mid-session: the per-frame membership check re-reads the role
+/// freshly, so the next audio frame after the downgrade closes the connection.
+#[tokio::test]
+#[ignore]
+async fn test_audio_member_downgrade_cuts_live_speaker() {
+    use futures_util::{SinkExt, StreamExt};
+
+    let url = relay_url();
+    ensure_test_community().await;
+    let owner_keys = Keys::generate();
+    let member_keys = Keys::generate();
+
+    let mut owner = buzz_test_client::BuzzTestClient::connect(&url, &owner_keys)
+        .await
+        .expect("connect as owner");
+    let channel_id = create_channel_ws(&mut owner, &owner_keys, "private").await;
+
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &member_keys.public_key().to_hex(),
+        Some("member"),
+        &owner_keys,
+    )
+    .await;
+    assert!(accepted, "owner should add member, got: {msg}");
+
+    // Join the huddle as the member and keep the raw socket.
+    let audio_url = format!("{}/huddle/{}/audio", url, channel_id);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&audio_url)
+        .await
+        .expect("connect audio ws");
+    let challenge_frame = ws
+        .next()
+        .await
+        .expect("challenge frame")
+        .expect("challenge ok");
+    let challenge_json: serde_json::Value =
+        serde_json::from_str(challenge_frame.to_text().expect("challenge text"))
+            .expect("challenge json");
+    let challenge = challenge_json["challenge"].as_str().unwrap().to_string();
+    let auth_event =
+        buzz_ws_client::build_auth_event(&challenge, &url, &member_keys, None).expect("auth");
+    let auth_msg = serde_json::json!({"type": "auth", "event": auth_event, "protocol_version": 1});
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        auth_msg.to_string().into(),
+    ))
+    .await
+    .expect("send auth");
+    let joined = ws.next().await.expect("joined frame").expect("joined ok");
+    assert!(
+        joined
+            .to_text()
+            .expect("joined text")
+            .contains("\"joined\""),
+        "member must be admitted, got: {joined}"
+    );
+
+    // While a member, frames flow and the connection stays open.
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+        vec![0, 1, 2, 3].into(),
+    ))
+    .await
+    .expect("pre-downgrade frame");
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Some(frame) = ws.next().await {
+            if let tokio_tungstenite::tungstenite::Message::Close(_) = frame.expect("frame") {
+                return true;
+            }
+        }
+        true
+    })
+    .await;
+    assert!(
+        closed.is_err(),
+        "member connection must stay open pre-downgrade"
+    );
+
+    // Downgrade the speaker to guest.
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &member_keys.public_key().to_hex(),
+        Some("guest"),
+        &owner_keys,
+    )
+    .await;
+    assert!(
+        accepted,
+        "owner should downgrade member to guest, got: {msg}"
+    );
+
+    // The next frame must trip the fresh guest probe and close the socket.
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+        vec![4, 5, 6, 7].into(),
+    ))
+    .await
+    .expect("post-downgrade frame");
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        while let Some(frame) = ws.next().await {
+            if let tokio_tungstenite::tungstenite::Message::Close(_) = frame.expect("frame") {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "downgraded guest speaker must be disconnected on the next frame"
+    );
+
+    owner.disconnect().await.expect("disconnect owner");
+}
