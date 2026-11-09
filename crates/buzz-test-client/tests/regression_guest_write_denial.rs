@@ -1745,9 +1745,9 @@ async fn test_guest_cannot_join_ephemeral_huddle_as_parent_guest() {
     owner.disconnect().await.expect("disconnect owner");
 }
 
-/// A member speaking in a huddle must be cut when its role is downgraded to
-/// guest mid-session: the per-frame membership check re-reads the role
-/// freshly, so the next audio frame after the downgrade closes the connection.
+/// A member speaking in an ephemeral huddle must be cut when the parent role
+/// is downgraded to guest mid-session, even though auto-add left huddle role
+/// as member.
 #[tokio::test]
 #[ignore]
 async fn test_audio_member_downgrade_cuts_live_speaker() {
@@ -1761,11 +1761,15 @@ async fn test_audio_member_downgrade_cuts_live_speaker() {
     let mut owner = buzz_test_client::BuzzTestClient::connect(&url, &owner_keys)
         .await
         .expect("connect as owner");
-    let channel_id = create_channel_ws(&mut owner, &owner_keys, "private").await;
+    let parent_id = create_channel_ws(&mut owner, &owner_keys, "private").await;
+    let huddle_id =
+        create_channel_custom_ws(&mut owner, &owner_keys, Some("private"), Some("600")).await;
+    start_huddle_link_ws(&mut owner, &parent_id, &huddle_id, &owner_keys).await;
+    let parent_uuid = uuid::Uuid::parse_str(&parent_id).expect("valid parent channel id");
 
     let (accepted, msg) = put_user_ws(
         &mut owner,
-        &channel_id,
+        &parent_id,
         &member_keys.public_key().to_hex(),
         Some("member"),
         &owner_keys,
@@ -1774,7 +1778,7 @@ async fn test_audio_member_downgrade_cuts_live_speaker() {
     assert!(accepted, "owner should add member, got: {msg}");
 
     // Join the huddle as the member and keep the raw socket.
-    let audio_url = format!("{}/huddle/{}/audio", url, channel_id);
+    let audio_url = format!("{}/huddle/{}/audio", url, huddle_id);
     let (mut ws, _) = tokio_tungstenite::connect_async(&audio_url)
         .await
         .expect("connect audio ws");
@@ -1789,7 +1793,12 @@ async fn test_audio_member_downgrade_cuts_live_speaker() {
     let challenge = challenge_json["challenge"].as_str().unwrap().to_string();
     let auth_event =
         buzz_ws_client::build_auth_event(&challenge, &url, &member_keys, None).expect("auth");
-    let auth_msg = serde_json::json!({"type": "auth", "event": auth_event, "protocol_version": 1});
+    let auth_msg = serde_json::json!({
+        "type": "auth",
+        "event": auth_event,
+        "protocol_version": 1,
+        "parent_channel_id": parent_uuid
+    });
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         auth_msg.to_string().into(),
     ))
@@ -1827,7 +1836,7 @@ async fn test_audio_member_downgrade_cuts_live_speaker() {
     // Downgrade the speaker to guest.
     let (accepted, msg) = put_user_ws(
         &mut owner,
-        &channel_id,
+        &parent_id,
         &member_keys.public_key().to_hex(),
         Some("guest"),
         &owner_keys,

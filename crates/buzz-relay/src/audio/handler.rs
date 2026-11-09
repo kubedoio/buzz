@@ -672,6 +672,7 @@ async fn handle_active_audio_connection(
         Arc::clone(&state),
         tenant.community(),
         channel_id,
+        parent_id_for_event,
         pubkey,
     ));
 
@@ -794,6 +795,7 @@ async fn handle_active_audio_connection(
         Arc::clone(&state),
         tenant.community(),
         channel_id,
+        parent_id_for_event,
         pubkey,
     )
     .await;
@@ -973,6 +975,7 @@ async fn recv_loop(
     state: Arc<AppState>,
     community: buzz_core::CommunityId,
     channel_id: Uuid,
+    parent_channel_id: Uuid,
     pubkey: nostr::PublicKey,
 ) {
     use crate::audio::wire::{FrameHeader, V2_HEADER_LEN};
@@ -984,7 +987,7 @@ async fn recv_loop(
             msg = ws_recv.next() => {
                 match msg {
                     Some(Ok(WsMessage::Binary(data))) => {
-                        if !audio_membership_allowed(&state, community, channel_id, &pubkey, &cancel).await {
+                        if !audio_membership_allowed(&state, community, channel_id, parent_channel_id, &pubkey, &cancel).await {
                             break;
                         }
                         if data.len() > MAX_AUDIO_FRAME_BYTES {
@@ -1089,12 +1092,22 @@ async fn send_loop(
     state: Arc<AppState>,
     community: buzz_core::CommunityId,
     channel_id: Uuid,
+    parent_channel_id: Uuid,
     pubkey: nostr::PublicKey,
 ) {
     loop {
         // Priority: drain all pending control frames before data.
         while let Ok(ctrl_msg) = ctrl_rx.try_recv() {
-            if !audio_membership_allowed(&state, community, channel_id, &pubkey, &cancel).await {
+            if !audio_membership_allowed(
+                &state,
+                community,
+                channel_id,
+                parent_channel_id,
+                &pubkey,
+                &cancel,
+            )
+            .await
+            {
                 return;
             }
             if ws_send.send(ctrl_msg).await.is_err() {
@@ -1109,11 +1122,11 @@ async fn send_loop(
                 break;
             }
             Some(ctrl_msg) = ctrl_rx.recv() => {
-                if !audio_membership_allowed(&state, community, channel_id, &pubkey, &cancel).await { break; }
+                if !audio_membership_allowed(&state, community, channel_id, parent_channel_id, &pubkey, &cancel).await { break; }
                 if ws_send.send(ctrl_msg).await.is_err() { break; }
             }
             Some(msg) = data_rx.recv() => {
-                if !audio_membership_allowed(&state, community, channel_id, &pubkey, &cancel).await { break; }
+                if !audio_membership_allowed(&state, community, channel_id, parent_channel_id, &pubkey, &cancel).await { break; }
                 if ws_send.send(msg).await.is_err() { break; }
             }
         }
@@ -1162,6 +1175,7 @@ async fn audio_membership_allowed(
     state: &AppState,
     community: buzz_core::CommunityId,
     channel_id: Uuid,
+    parent_channel_id: Uuid,
     pubkey: &nostr::PublicKey,
     cancel: &CancellationToken,
 ) -> bool {
@@ -1177,6 +1191,19 @@ async fn audio_membership_allowed(
     )
     .await
     .is_err()
+    {
+        cancel.cancel();
+        return false;
+    }
+    if parent_channel_id != channel_id
+        && crate::handlers::ingest::check_not_guest_identity(
+            community,
+            state,
+            Some(parent_channel_id),
+            pubkey.as_bytes(),
+        )
+        .await
+        .is_err()
     {
         cancel.cancel();
         return false;
