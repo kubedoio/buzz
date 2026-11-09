@@ -689,25 +689,29 @@ pub(crate) async fn check_channel_write_role(
 
 /// Fresh identity-level guest probe for write surfaces the channel write gate
 /// does not cover (audio huddle admission, the owner-of-agent fallbacks in the
-/// per-kind admin validators). Denies when the actor holds the guest role in
-/// the named channel or at relay level; every other identity — including
-/// non-members, who keep their documented admission flows — passes. Both role
-/// reads are fresh primary-database reads, matching `check_channel_write_role`:
-/// no cached permission survives a member→guest downgrade.
+/// per-kind admin validators, kind:5 deletions). Denies when the actor holds
+/// the guest role in the named channel or at relay level; every other
+/// identity — including non-members, who keep their documented admission
+/// flows — passes. `channel_id: None` probes the relay level only (e.g.
+/// channel-less deletion targets). Both role reads are fresh
+/// primary-database reads, matching `check_channel_write_role`: no cached
+/// permission survives a member→guest downgrade.
 pub(crate) async fn check_not_guest_identity(
     community_id: CommunityId,
     state: &AppState,
-    channel_id: Uuid,
+    channel_id: Option<Uuid>,
     pubkey_bytes: &[u8],
 ) -> Result<(), String> {
-    if let Some(role) = state
-        .db
-        .get_member_role(community_id, channel_id, pubkey_bytes)
-        .await
-        .map_err(|e| format!("error: database error: {e}"))?
-    {
-        if role == "guest" {
-            return Err("restricted: guest members are read-only".to_string());
+    if let Some(channel_id) = channel_id {
+        if let Some(role) = state
+            .db
+            .get_member_role(community_id, channel_id, pubkey_bytes)
+            .await
+            .map_err(|e| format!("error: database error: {e}"))?
+        {
+            if role == "guest" {
+                return Err("restricted: guest members are read-only".to_string());
+            }
         }
     }
     if let Some(member) = state
@@ -1023,7 +1027,7 @@ async fn validate_edit_ownership(
         // ownership (the generic gate skips this kind; per-kind validators
         // are the authority).
         if let Some(ch_id) = target_event.channel_id {
-            check_not_guest_identity(community_id, state, ch_id, &actor).await?;
+            check_not_guest_identity(community_id, state, Some(ch_id), &actor).await?;
         }
         let is_owner = state
             .db

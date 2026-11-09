@@ -132,6 +132,39 @@ async fn remove_user_ws(
     (ok.accepted, ok.message)
 }
 
+/// Record that `human` owns `agent` (`users.agent_owner_pubkey`). The human's
+/// own users row must exist first: agent_owner_pubkey is a self-referencing
+/// foreign key.
+async fn seed_agent_owner(
+    pool: &sqlx::Pool<sqlx::Postgres>,
+    community_id: uuid::Uuid,
+    agent_keys: &Keys,
+    human_keys: &Keys,
+) {
+    sqlx::query(
+        "INSERT INTO users (community_id, pubkey) \
+         VALUES ($1, $2) \
+         ON CONFLICT (community_id, pubkey) DO NOTHING",
+    )
+    .bind(community_id)
+    .bind(human_keys.public_key().to_bytes())
+    .execute(pool)
+    .await
+    .expect("seed human user row");
+    sqlx::query(
+        "INSERT INTO users (community_id, pubkey, agent_owner_pubkey) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (community_id, pubkey) \
+         DO UPDATE SET agent_owner_pubkey = EXCLUDED.agent_owner_pubkey",
+    )
+    .bind(community_id)
+    .bind(agent_keys.public_key().to_bytes())
+    .bind(human_keys.public_key().to_bytes())
+    .execute(pool)
+    .await
+    .expect("seed agent ownership");
+}
+
 /// Sign a kind:9 channel message.
 fn stream_message(keys: &Keys, channel_id: &str, content: &str) -> Event {
     EventBuilder::new(Kind::Custom(9), content)
@@ -1397,31 +1430,9 @@ async fn test_guest_cannot_edit_privileged_metadata_via_owned_owner_agent() {
     .await;
     assert!(accepted, "owner should add agent as owner, got: {msg}");
 
-    // ...and the guest human owns the agent. The guest's own users row must
-    // exist first: agent_owner_pubkey is a self-referencing foreign key.
+    // ...and the guest human owns the agent.
     let pool = e2e_db_pool().await;
-    sqlx::query(
-        "INSERT INTO users (community_id, pubkey) \
-         VALUES ($1, $2) \
-         ON CONFLICT (community_id, pubkey) DO NOTHING",
-    )
-    .bind(community_id)
-    .bind(guest_keys.public_key().to_bytes())
-    .execute(&pool)
-    .await
-    .expect("seed guest user row");
-    sqlx::query(
-        "INSERT INTO users (community_id, pubkey, agent_owner_pubkey) \
-         VALUES ($1, $2, $3) \
-         ON CONFLICT (community_id, pubkey) \
-         DO UPDATE SET agent_owner_pubkey = EXCLUDED.agent_owner_pubkey",
-    )
-    .bind(community_id)
-    .bind(agent_keys.public_key().to_bytes())
-    .bind(guest_keys.public_key().to_bytes())
-    .execute(&pool)
-    .await
-    .expect("seed agent ownership");
+    seed_agent_owner(&pool, community_id, &agent_keys, &guest_keys).await;
 
     // The guest is a read-only channel participant.
     let (accepted, msg) = put_user_ws(
@@ -1518,16 +1529,23 @@ async fn test_guest_cannot_join_audio_huddle() {
 
     let audio_url = format!("{}/huddle/{}/audio", url, channel_id);
 
-    // Guest: completes NIP-42 auth, then must be refused at membership.
-    let reply = huddle_handshake(&audio_url, &url, &guest_keys).await;
+    // Guest: completes NIP-42 auth, then must be refused at membership. The
+    // refusal carries a distinct `reason` so a guest denial is distinguishable
+    // from a generic refusal.
+    let reply = huddle_handshake(&audio_url, &url, &guest_keys, None).await;
+    let reply_json: serde_json::Value = serde_json::from_str(&reply).unwrap_or_default();
+    assert_eq!(reply_json["type"], "error");
     assert!(
-        reply.contains("\"error\"") && reply.contains("not a member"),
-        "guest audio join must be refused with the membership error, got: {reply}"
+        reply_json["reason"]
+            .as_str()
+            .map(|r| r.contains("guest") || r.contains("read-only"))
+            .unwrap_or(false),
+        "guest audio join must be refused with a distinct guest reason, got: {reply}"
     );
 
     // Control: a member completing the same handshake is admitted (receives
     // the joined frame), so the guest refusal is not a blanket audio outage.
-    let reply = huddle_handshake(&audio_url, &url, &member_keys).await;
+    let reply = huddle_handshake(&audio_url, &url, &member_keys, None).await;
     assert!(
         reply.contains("\"joined\""),
         "member audio join must proceed to joined, got: {reply}"
@@ -1537,9 +1555,15 @@ async fn test_guest_cannot_join_audio_huddle() {
 }
 
 /// Drive the huddle audio WebSocket handshake through NIP-42 auth and return
-/// the first post-auth text frame: the error payload on refusal, or the
-/// joined frame on admission.
-async fn huddle_handshake(audio_url: &str, relay_url: &str, keys: &Keys) -> String {
+/// the first post-auth text frame: the error payload on refusal (with a
+/// `reason` field for guest read-only denials), or the joined frame on
+/// admission. `parent` is the claimed parent linkage for ephemeral huddles.
+async fn huddle_handshake(
+    audio_url: &str,
+    relay_url: &str,
+    keys: &Keys,
+    parent: Option<uuid::Uuid>,
+) -> String {
     use futures_util::{SinkExt, StreamExt};
 
     let (mut ws, _) = tokio_tungstenite::connect_async(audio_url)
@@ -1561,7 +1585,11 @@ async fn huddle_handshake(audio_url: &str, relay_url: &str, keys: &Keys) -> Stri
 
     let auth_event =
         buzz_ws_client::build_auth_event(&challenge, relay_url, keys, None).expect("auth event");
-    let auth_msg = serde_json::json!({"type": "auth", "event": auth_event, "protocol_version": 1});
+    let mut auth_msg =
+        serde_json::json!({"type": "auth", "event": auth_event, "protocol_version": 1});
+    if let Some(parent) = parent {
+        auth_msg["parent_channel_id"] = serde_json::json!(parent.to_string());
+    }
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         auth_msg.to_string().into(),
     ))
@@ -1579,4 +1607,794 @@ async fn huddle_handshake(audio_url: &str, relay_url: &str, keys: &Keys) -> Stri
     })
     .await
     .expect("post-auth frame timeout")
+}
+
+/// Create a channel over WebSocket with explicit visibility/ttl tags and
+/// return the channel UUID. `visibility: None` omits the tag — the create
+/// path defaults to "open", which is how real ephemeral huddles are born.
+async fn create_channel_custom_ws(
+    client: &mut buzz_test_client::BuzzTestClient,
+    keys: &Keys,
+    visibility: Option<&str>,
+    ttl: Option<&str>,
+) -> String {
+    let channel_uuid = uuid::Uuid::new_v4().to_string();
+    let channel_name = format!("guest-denial-{}", channel_uuid);
+    let mut tags = vec![
+        Tag::parse(["h", &channel_uuid]).unwrap(),
+        Tag::parse(["name", &channel_name]).unwrap(),
+        Tag::parse(["channel_type", "stream"]).unwrap(),
+    ];
+    if let Some(visibility) = visibility {
+        tags.push(Tag::parse(["visibility", visibility]).unwrap());
+    }
+    if let Some(ttl) = ttl {
+        tags.push(Tag::parse(["ttl", ttl]).unwrap());
+    }
+    let event = EventBuilder::new(Kind::Custom(9007), "")
+        .tags(tags)
+        .sign_with_keys(keys)
+        .unwrap();
+    let ok = client.send_event(event).await.expect("create channel");
+    assert!(ok.accepted, "channel creation failed: {}", ok.message);
+    channel_uuid
+}
+
+/// Publish the creator-signed kind:48100 link that ties an ephemeral huddle
+/// to its parent channel.
+async fn start_huddle_link_ws(
+    client: &mut buzz_test_client::BuzzTestClient,
+    parent_channel_id: &str,
+    huddle_channel_id: &str,
+    signer: &Keys,
+) {
+    let content = serde_json::json!({"ephemeral_channel_id": huddle_channel_id}).to_string();
+    let event = EventBuilder::new(Kind::Custom(48100), content)
+        .tags(vec![Tag::parse(["h", parent_channel_id]).unwrap()])
+        .sign_with_keys(signer)
+        .unwrap();
+    let ok = client.send_event(event).await.expect("send huddle start");
+    assert!(ok.accepted, "huddle start link failed: {}", ok.message);
+}
+
+/// Sign a kind:5 (NIP-09) deletion of an addressable target via a tag.
+fn nip09_a_tag_delete(keys: &Keys, a_tag: &str) -> Event {
+    EventBuilder::new(Kind::Custom(5), "")
+        .tags(vec![Tag::parse(["a", a_tag]).unwrap()])
+        .sign_with_keys(keys)
+        .unwrap()
+}
+
+/// Sign a kind:5 (NIP-09) deletion of a regular event via e tag.
+fn nip09_e_tag_delete(keys: &Keys, target_id: &str) -> Event {
+    EventBuilder::new(Kind::Custom(5), "")
+        .tags(vec![Tag::parse(["e", target_id]).unwrap()])
+        .sign_with_keys(keys)
+        .unwrap()
+}
+
+/// A guest of the PARENT channel must not be able to speak in that channel's
+/// ephemeral huddles: admission derives from the parent (the auto-add path
+/// inserts parent members as full members, and an ephemeral channel without
+/// an explicit visibility tag defaults to open), so the guest probe must run
+/// against the parent too before any admission path can fire.
+#[tokio::test]
+#[ignore]
+async fn test_guest_cannot_join_ephemeral_huddle_as_parent_guest() {
+    let url = relay_url();
+    ensure_test_community().await;
+    let owner_keys = Keys::generate();
+    let guest_keys = Keys::generate();
+    let member_keys = Keys::generate();
+
+    let mut owner = buzz_test_client::BuzzTestClient::connect(&url, &owner_keys)
+        .await
+        .expect("connect as owner");
+    let parent_id = create_channel_ws(&mut owner, &owner_keys, "private").await;
+
+    for (keys, role) in [(&guest_keys, "guest"), (&member_keys, "member")] {
+        let (accepted, msg) = put_user_ws(
+            &mut owner,
+            &parent_id,
+            &keys.public_key().to_hex(),
+            Some(role),
+            &owner_keys,
+        )
+        .await;
+        assert!(accepted, "owner should add {role} to parent, got: {msg}");
+    }
+
+    // Ephemeral huddle with NO visibility tag — defaults to open, the
+    // fallback-admission case.
+    let open_huddle = create_channel_custom_ws(&mut owner, &owner_keys, None, Some("600")).await;
+    start_huddle_link_ws(&mut owner, &parent_id, &open_huddle, &owner_keys).await;
+
+    // Ephemeral huddle explicitly private — the auto-add case.
+    let private_huddle =
+        create_channel_custom_ws(&mut owner, &owner_keys, Some("private"), Some("600")).await;
+    start_huddle_link_ws(&mut owner, &parent_id, &private_huddle, &owner_keys).await;
+
+    let parent_uuid = uuid::Uuid::parse_str(&parent_id).unwrap();
+
+    for huddle in [&open_huddle, &private_huddle] {
+        let audio_url = format!("{}/huddle/{}/audio", url, huddle);
+        let reply = huddle_handshake(&audio_url, &url, &guest_keys, Some(parent_uuid)).await;
+        let reply_json: serde_json::Value = serde_json::from_str(&reply).unwrap_or_default();
+        assert_eq!(
+            reply_json["type"], "error",
+            "parent guest must be refused for huddle {huddle}: {reply}"
+        );
+        assert!(
+            reply_json["reason"]
+                .as_str()
+                .map(|r| r.contains("guest") || r.contains("read-only"))
+                .unwrap_or(false),
+            "parent guest refusal must name the guest read-only restriction, got: {reply}"
+        );
+    }
+
+    // Control: a parent member is admitted to the private huddle via the
+    // auto-add path — the parent probe must not over-deny.
+    let audio_url = format!("{}/huddle/{}/audio", url, private_huddle);
+    let reply = huddle_handshake(&audio_url, &url, &member_keys, Some(parent_uuid)).await;
+    assert!(
+        reply.contains("\"joined\""),
+        "parent member must be auto-admitted to the private huddle, got: {reply}"
+    );
+
+    owner.disconnect().await.expect("disconnect owner");
+}
+
+/// A member speaking in a huddle must be cut when its role is downgraded to
+/// guest mid-session: the per-frame membership check re-reads the role
+/// freshly, so the next audio frame after the downgrade closes the connection.
+#[tokio::test]
+#[ignore]
+async fn test_audio_member_downgrade_cuts_live_speaker() {
+    use futures_util::{SinkExt, StreamExt};
+
+    let url = relay_url();
+    ensure_test_community().await;
+    let owner_keys = Keys::generate();
+    let member_keys = Keys::generate();
+
+    let mut owner = buzz_test_client::BuzzTestClient::connect(&url, &owner_keys)
+        .await
+        .expect("connect as owner");
+    let channel_id = create_channel_ws(&mut owner, &owner_keys, "private").await;
+
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &member_keys.public_key().to_hex(),
+        Some("member"),
+        &owner_keys,
+    )
+    .await;
+    assert!(accepted, "owner should add member, got: {msg}");
+
+    // Join the huddle as the member and keep the raw socket.
+    let audio_url = format!("{}/huddle/{}/audio", url, channel_id);
+    let (mut ws, _) = tokio_tungstenite::connect_async(&audio_url)
+        .await
+        .expect("connect audio ws");
+    let challenge_frame = ws
+        .next()
+        .await
+        .expect("challenge frame")
+        .expect("challenge ok");
+    let challenge_json: serde_json::Value =
+        serde_json::from_str(challenge_frame.to_text().expect("challenge text"))
+            .expect("challenge json");
+    let challenge = challenge_json["challenge"].as_str().unwrap().to_string();
+    let auth_event =
+        buzz_ws_client::build_auth_event(&challenge, &url, &member_keys, None).expect("auth");
+    let auth_msg = serde_json::json!({"type": "auth", "event": auth_event, "protocol_version": 1});
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        auth_msg.to_string().into(),
+    ))
+    .await
+    .expect("send auth");
+    let joined = ws.next().await.expect("joined frame").expect("joined ok");
+    assert!(
+        joined
+            .to_text()
+            .expect("joined text")
+            .contains("\"joined\""),
+        "member must be admitted, got: {joined}"
+    );
+
+    // While a member, frames flow and the connection stays open.
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+        vec![0, 1, 2, 3].into(),
+    ))
+    .await
+    .expect("pre-downgrade frame");
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Some(frame) = ws.next().await {
+            if let tokio_tungstenite::tungstenite::Message::Close(_) = frame.expect("frame") {
+                return true;
+            }
+        }
+        true
+    })
+    .await;
+    assert!(
+        closed.is_err(),
+        "member connection must stay open pre-downgrade"
+    );
+
+    // Downgrade the speaker to guest.
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &member_keys.public_key().to_hex(),
+        Some("guest"),
+        &owner_keys,
+    )
+    .await;
+    assert!(
+        accepted,
+        "owner should downgrade member to guest, got: {msg}"
+    );
+
+    // The next frame must trip the fresh guest probe and close the socket.
+    ws.send(tokio_tungstenite::tungstenite::Message::Binary(
+        vec![4, 5, 6, 7].into(),
+    ))
+    .await
+    .expect("post-downgrade frame");
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        while let Some(frame) = ws.next().await {
+            if let tokio_tungstenite::tungstenite::Message::Close(_) = frame.expect("frame") {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "downgraded guest speaker must be disconnected on the next frame"
+    );
+
+    owner.disconnect().await.expect("disconnect owner");
+}
+
+/// A guest owning an owner-role agent must not be able to NIP-09 (kind:5)
+/// delete the agent's channel-scoped addressable events: kind:5 is not
+/// h-scoped, so a-tag deletions never pass the generic write gate and the
+/// ownership fallback must not lift the guest read-only restriction.
+#[tokio::test]
+#[ignore]
+async fn test_guest_cannot_delete_agent_workflow_definition() {
+    let url = relay_url();
+    let community_id = ensure_test_community().await;
+    let owner_keys = Keys::generate();
+    let agent_keys = Keys::generate();
+    let guest_keys = Keys::generate();
+
+    let mut owner = buzz_test_client::BuzzTestClient::connect(&url, &owner_keys)
+        .await
+        .expect("connect as owner");
+    // Open channel: the agent (a non-member) can define a workflow in it.
+    let channel_id = create_channel_ws(&mut owner, &owner_keys, "open").await;
+
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &guest_keys.public_key().to_hex(),
+        Some("guest"),
+        &owner_keys,
+    )
+    .await;
+    assert!(accepted, "owner should add guest, got: {msg}");
+
+    let pool = e2e_db_pool().await;
+    seed_agent_owner(&pool, community_id, &agent_keys, &guest_keys).await;
+
+    let mut agent = buzz_test_client::BuzzTestClient::connect(&url, &agent_keys)
+        .await
+        .expect("connect as agent");
+    let workflow_id = uuid::Uuid::new_v4().to_string();
+    let ok = agent
+        .send_event(workflow_def(
+            &agent_keys,
+            &channel_id,
+            &workflow_id,
+            "agent-def",
+            "agent-def-marker",
+        ))
+        .await
+        .expect("agent kind:30620 publish");
+    assert!(
+        ok.accepted,
+        "agent workflow definition must be accepted: {}",
+        ok.message
+    );
+
+    let a_tag = format!("30620:{}:{workflow_id}", agent_keys.public_key().to_hex());
+    let mut guest = buzz_test_client::BuzzTestClient::connect(&url, &guest_keys)
+        .await
+        .expect("connect as guest");
+    let ok = guest
+        .send_event(nip09_a_tag_delete(&guest_keys, &a_tag))
+        .await
+        .expect("guest kind:5 a-tag publish");
+    assert!(
+        !ok.accepted,
+        "guest must not delete the agent's workflow definition via kind:5, but it was accepted: {}",
+        ok.message
+    );
+    assert!(
+        ok.message.contains("guest") || ok.message.contains("read-only"),
+        "rejection should name the guest read-only restriction, got: {}",
+        ok.message
+    );
+
+    // Control: the agent deleting its own definition stays allowed.
+    let ok = agent
+        .send_event(nip09_a_tag_delete(&agent_keys, &a_tag))
+        .await
+        .expect("agent kind:5 a-tag publish");
+    assert!(
+        ok.accepted,
+        "agent self-delete of its definition must be accepted: {}",
+        ok.message
+    );
+
+    owner.disconnect().await.expect("disconnect owner");
+    agent.disconnect().await.expect("disconnect agent");
+    guest.disconnect().await.expect("disconnect guest");
+}
+
+/// A member downgraded to guest must not be able to kind:5-delete its own
+/// pre-downgrade addressable events: the author self-deletion re-gates the
+/// current role through the shared write gate, mirroring kind:9005.
+#[tokio::test]
+#[ignore]
+async fn test_downgraded_guest_cannot_delete_own_addressable_event() {
+    let url = relay_url();
+    ensure_test_community().await;
+    let owner_keys = Keys::generate();
+    let member_keys = Keys::generate();
+
+    let mut owner = buzz_test_client::BuzzTestClient::connect(&url, &owner_keys)
+        .await
+        .expect("connect as owner");
+    let channel_id = create_channel_ws(&mut owner, &owner_keys, "open").await;
+
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &member_keys.public_key().to_hex(),
+        Some("member"),
+        &owner_keys,
+    )
+    .await;
+    assert!(accepted, "owner should add member, got: {msg}");
+
+    let mut member = buzz_test_client::BuzzTestClient::connect(&url, &member_keys)
+        .await
+        .expect("connect as member");
+    let control_def = uuid::Uuid::new_v4().to_string();
+    let probe_def = uuid::Uuid::new_v4().to_string();
+    for (wf, name) in [(&control_def, "control-def"), (&probe_def, "probe-def")] {
+        let ok = member
+            .send_event(workflow_def(
+                &member_keys,
+                &channel_id,
+                wf,
+                name,
+                &format!("{name}-marker"),
+            ))
+            .await
+            .expect("member kind:30620 publish");
+        assert!(
+            ok.accepted,
+            "member workflow definition must be accepted: {}",
+            ok.message
+        );
+    }
+
+    // Control: a member can still kind:5-delete its own addressable event.
+    let control_tag = format!("30620:{}:{control_def}", member_keys.public_key().to_hex());
+    let ok = member
+        .send_event(nip09_a_tag_delete(&member_keys, &control_tag))
+        .await
+        .expect("member kind:5 a-tag publish");
+    assert!(
+        ok.accepted,
+        "member self-delete must be accepted: {}",
+        ok.message
+    );
+
+    // Downgrade, then the same self-delete must be refused.
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &member_keys.public_key().to_hex(),
+        Some("guest"),
+        &owner_keys,
+    )
+    .await;
+    assert!(
+        accepted,
+        "owner should downgrade member to guest, got: {msg}"
+    );
+
+    let probe_tag = format!("30620:{}:{probe_def}", member_keys.public_key().to_hex());
+    let ok = member
+        .send_event(nip09_a_tag_delete(&member_keys, &probe_tag))
+        .await
+        .expect("downgraded kind:5 a-tag publish");
+    assert!(
+        !ok.accepted,
+        "downgraded guest must not delete its own pre-downgrade addressable event, but it was accepted: {}",
+        ok.message
+    );
+    assert!(
+        ok.message.contains("guest") || ok.message.contains("read-only"),
+        "rejection should name the guest read-only restriction, got: {}",
+        ok.message
+    );
+
+    owner.disconnect().await.expect("disconnect owner");
+    member.disconnect().await.expect("disconnect member");
+}
+
+/// A guest owning an agent must not be able to kind:5-delete the agent's
+/// channel-scoped messages: the write gate derives the target's channel for
+/// e-tag deletions and denies the guest identity.
+#[tokio::test]
+#[ignore]
+async fn test_guest_cannot_delete_agents_message_kind5() {
+    let url = relay_url();
+    let community_id = ensure_test_community().await;
+    let owner_keys = Keys::generate();
+    let agent_keys = Keys::generate();
+    let guest_keys = Keys::generate();
+
+    let mut owner = buzz_test_client::BuzzTestClient::connect(&url, &owner_keys)
+        .await
+        .expect("connect as owner");
+    let channel_id = create_channel_ws(&mut owner, &owner_keys, "open").await;
+
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &guest_keys.public_key().to_hex(),
+        Some("guest"),
+        &owner_keys,
+    )
+    .await;
+    assert!(accepted, "owner should add guest, got: {msg}");
+
+    let pool = e2e_db_pool().await;
+    seed_agent_owner(&pool, community_id, &agent_keys, &guest_keys).await;
+
+    let mut agent = buzz_test_client::BuzzTestClient::connect(&url, &agent_keys)
+        .await
+        .expect("connect as agent");
+    let ok = agent
+        .send_event(stream_message(&agent_keys, &channel_id, "agent message"))
+        .await
+        .expect("agent kind:9 publish");
+    assert!(ok.accepted, "agent kind:9 must be accepted: {}", ok.message);
+
+    let mut guest = buzz_test_client::BuzzTestClient::connect(&url, &guest_keys)
+        .await
+        .expect("connect as guest");
+    let ok = guest
+        .send_event(nip09_e_tag_delete(&guest_keys, &ok.event_id))
+        .await
+        .expect("guest kind:5 e-tag publish");
+    assert!(
+        !ok.accepted,
+        "guest must not delete the agent's message via kind:5, but it was accepted: {}",
+        ok.message
+    );
+    assert!(
+        ok.message.contains("guest") || ok.message.contains("read-only"),
+        "rejection should name the guest read-only restriction, got: {}",
+        ok.message
+    );
+
+    owner.disconnect().await.expect("disconnect owner");
+    agent.disconnect().await.expect("disconnect agent");
+    guest.disconnect().await.expect("disconnect guest");
+}
+
+/// A guest owning an agent must not be able to kind:40003-edit the agent's
+/// messages: the ownership fallback re-gates the actor's fresh roles first.
+#[tokio::test]
+#[ignore]
+async fn test_guest_cannot_edit_agents_message() {
+    let url = relay_url();
+    let community_id = ensure_test_community().await;
+    let owner_keys = Keys::generate();
+    let agent_keys = Keys::generate();
+    let guest_keys = Keys::generate();
+
+    let mut owner = buzz_test_client::BuzzTestClient::connect(&url, &owner_keys)
+        .await
+        .expect("connect as owner");
+    let channel_id = create_channel_ws(&mut owner, &owner_keys, "open").await;
+
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &guest_keys.public_key().to_hex(),
+        Some("guest"),
+        &owner_keys,
+    )
+    .await;
+    assert!(accepted, "owner should add guest, got: {msg}");
+
+    let pool = e2e_db_pool().await;
+    seed_agent_owner(&pool, community_id, &agent_keys, &guest_keys).await;
+
+    let mut agent = buzz_test_client::BuzzTestClient::connect(&url, &agent_keys)
+        .await
+        .expect("connect as agent");
+    let ok = agent
+        .send_event(stream_message(&agent_keys, &channel_id, "agent original"))
+        .await
+        .expect("agent kind:9 publish");
+    assert!(ok.accepted, "agent kind:9 must be accepted: {}", ok.message);
+
+    let mut guest = buzz_test_client::BuzzTestClient::connect(&url, &guest_keys)
+        .await
+        .expect("connect as guest");
+    let ok = guest
+        .send_event(stream_message_edit(
+            &guest_keys,
+            &channel_id,
+            &ok.event_id,
+            "guest takeover edit",
+        ))
+        .await
+        .expect("guest kind:40003 publish");
+    assert!(
+        !ok.accepted,
+        "guest must not edit the agent's message via the ownership fallback, but it was accepted: {}",
+        ok.message
+    );
+    assert!(
+        ok.message.contains("guest") || ok.message.contains("read-only"),
+        "rejection should name the guest read-only restriction, got: {}",
+        ok.message
+    );
+
+    // Control: the agent editing its own message stays allowed.
+    let mut agent_client = buzz_test_client::BuzzTestClient::connect(&url, &agent_keys)
+        .await
+        .expect("connect as agent again");
+    let ok = agent_client
+        .send_event(stream_message(&agent_keys, &channel_id, "agent control"))
+        .await
+        .expect("agent control kind:9 publish");
+    assert!(
+        ok.accepted,
+        "agent control kind:9 must be accepted: {}",
+        ok.message
+    );
+    let ok = agent_client
+        .send_event(stream_message_edit(
+            &agent_keys,
+            &channel_id,
+            &ok.event_id,
+            "agent self edit",
+        ))
+        .await
+        .expect("agent kind:40003 publish");
+    assert!(
+        ok.accepted,
+        "agent self-edit must be accepted: {}",
+        ok.message
+    );
+
+    owner.disconnect().await.expect("disconnect owner");
+    agent.disconnect().await.expect("disconnect agent");
+    guest.disconnect().await.expect("disconnect guest");
+    agent_client
+        .disconnect()
+        .await
+        .expect("disconnect agent control");
+}
+
+/// A guest owning an owner-role agent must not be able to kind:9005-delete the
+/// agent's messages.
+#[tokio::test]
+#[ignore]
+async fn test_guest_cannot_delete_agents_message_9005() {
+    let url = relay_url();
+    let community_id = ensure_test_community().await;
+    let owner_keys = Keys::generate();
+    let agent_keys = Keys::generate();
+    let guest_keys = Keys::generate();
+
+    let mut owner = buzz_test_client::BuzzTestClient::connect(&url, &owner_keys)
+        .await
+        .expect("connect as owner");
+    let channel_id = create_channel_ws(&mut owner, &owner_keys, "open").await;
+
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &guest_keys.public_key().to_hex(),
+        Some("guest"),
+        &owner_keys,
+    )
+    .await;
+    assert!(accepted, "owner should add guest, got: {msg}");
+
+    let pool = e2e_db_pool().await;
+    seed_agent_owner(&pool, community_id, &agent_keys, &guest_keys).await;
+
+    let mut agent = buzz_test_client::BuzzTestClient::connect(&url, &agent_keys)
+        .await
+        .expect("connect as agent");
+    let ok = agent
+        .send_event(stream_message(
+            &agent_keys,
+            &channel_id,
+            "agent message 9005",
+        ))
+        .await
+        .expect("agent kind:9 publish");
+    assert!(ok.accepted, "agent kind:9 must be accepted: {}", ok.message);
+    let target_id = ok.event_id;
+
+    let mut guest = buzz_test_client::BuzzTestClient::connect(&url, &guest_keys)
+        .await
+        .expect("connect as guest");
+    let ok = guest
+        .send_event(delete_event(&guest_keys, &channel_id, &target_id))
+        .await
+        .expect("guest kind:9005 publish");
+    assert!(
+        !ok.accepted,
+        "guest must not delete the agent's message via kind:9005, but it was accepted: {}",
+        ok.message
+    );
+    assert!(
+        ok.message.contains("guest") || ok.message.contains("read-only"),
+        "rejection should name the guest read-only restriction, got: {}",
+        ok.message
+    );
+
+    // Control: the channel owner deleting the agent's message stays allowed.
+    let ok = owner
+        .send_event(delete_event(&owner_keys, &channel_id, &target_id))
+        .await
+        .expect("owner kind:9005 publish");
+    assert!(
+        ok.accepted,
+        "owner kind:9005 delete must be accepted: {}",
+        ok.message
+    );
+
+    owner.disconnect().await.expect("disconnect owner");
+    agent.disconnect().await.expect("disconnect agent");
+    guest.disconnect().await.expect("disconnect guest");
+}
+
+/// A guest owning an owner-role agent must not be able to kind:9008-delete the
+/// channel through the ownership fallback.
+#[tokio::test]
+#[ignore]
+async fn test_guest_cannot_delete_group_via_owned_agent() {
+    let url = relay_url();
+    let community_id = ensure_test_community().await;
+    let owner_keys = Keys::generate();
+    let agent_keys = Keys::generate();
+    let guest_keys = Keys::generate();
+    let fallback_agent_keys = Keys::generate();
+    let fallback_human_keys = Keys::generate();
+
+    let mut owner = buzz_test_client::BuzzTestClient::connect(&url, &owner_keys)
+        .await
+        .expect("connect as owner");
+    let channel_id = create_channel_ws(&mut owner, &owner_keys, "private").await;
+
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &agent_keys.public_key().to_hex(),
+        Some("owner"),
+        &owner_keys,
+    )
+    .await;
+    assert!(accepted, "owner should add agent as owner, got: {msg}");
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &guest_keys.public_key().to_hex(),
+        Some("guest"),
+        &owner_keys,
+    )
+    .await;
+    assert!(accepted, "owner should add guest, got: {msg}");
+
+    let pool = e2e_db_pool().await;
+    seed_agent_owner(&pool, community_id, &agent_keys, &guest_keys).await;
+    seed_agent_owner(
+        &pool,
+        community_id,
+        &fallback_agent_keys,
+        &fallback_human_keys,
+    )
+    .await;
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &fallback_agent_keys.public_key().to_hex(),
+        Some("owner"),
+        &owner_keys,
+    )
+    .await;
+    assert!(
+        accepted,
+        "owner should add fallback agent as owner, got: {msg}"
+    );
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &fallback_human_keys.public_key().to_hex(),
+        Some("member"),
+        &owner_keys,
+    )
+    .await;
+    assert!(
+        accepted,
+        "owner should add fallback human as member, got: {msg}"
+    );
+
+    let mut guest = buzz_test_client::BuzzTestClient::connect(&url, &guest_keys)
+        .await
+        .expect("connect as guest");
+    let event = EventBuilder::new(Kind::Custom(9008), "")
+        .tags(vec![Tag::parse(["h", &channel_id]).unwrap()])
+        .sign_with_keys(&guest_keys)
+        .unwrap();
+    let ok = guest
+        .send_event(event)
+        .await
+        .expect("guest kind:9008 publish");
+    assert!(
+        !ok.accepted,
+        "guest must not delete the group via the owned owner agent, but it was accepted: {}",
+        ok.message
+    );
+    assert!(
+        ok.message.contains("guest") || ok.message.contains("read-only"),
+        "rejection should name the guest read-only restriction, got: {}",
+        ok.message
+    );
+
+    // Control: a non-guest owning human (a plain member, not owner/admin)
+    // keeps the ownership fallback — kind:9008 stays allowed for them.
+    let mut fallback_human = buzz_test_client::BuzzTestClient::connect(&url, &fallback_human_keys)
+        .await
+        .expect("connect as fallback human");
+    let event = EventBuilder::new(Kind::Custom(9008), "")
+        .tags(vec![Tag::parse(["h", &channel_id]).unwrap()])
+        .sign_with_keys(&fallback_human_keys)
+        .unwrap();
+    let ok = fallback_human
+        .send_event(event)
+        .await
+        .expect("fallback human kind:9008 publish");
+    assert!(
+        ok.accepted,
+        "non-guest owner-of-agent kind:9008 must stay allowed: {}",
+        ok.message
+    );
+
+    owner.disconnect().await.expect("disconnect owner");
+    guest.disconnect().await.expect("disconnect guest");
+    fallback_human
+        .disconnect()
+        .await
+        .expect("disconnect fallback human");
 }
