@@ -1022,6 +1022,13 @@ async fn validate_edit_ownership(
         }
     } else {
         // Allow the owning human to edit messages authored by their agent.
+        // The ownership fallback must not lift the guest read-only
+        // restriction: probe the actor's fresh roles before consulting
+        // ownership (the generic gate skips this kind; per-kind validators
+        // are the authority).
+        if let Some(ch_id) = target_event.channel_id {
+            check_not_guest_identity(community_id, state, Some(ch_id), &actor).await?;
+        }
         let is_owner = state
             .db
             .is_agent_owner(community_id, &author, &actor)

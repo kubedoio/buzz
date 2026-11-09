@@ -1,14 +1,15 @@
 //! Regression tests for guest-role write authorization on channel-scoped
 //! writes: channel messages (kind:9 / KIND_STREAM_MESSAGE), channel metadata
 //! edits (kind:9002 topic/purpose and the privileged name/about/archived/
-//! visibility/ttl tags), message edits (kind:40003 self-edit), message
-//! deletes (kind:9005 self-delete), huddle audio admission (speaking is a
-//! channel write, including parent-linked ephemeral huddles), channel-scoped
-//! command events (kind:30620 workflow definitions, kind:41011 DM
-//! add-member), NIP-09 kind:5 deletions of addressable and regular targets,
-//! and the durable indirect write a workflow performs through its owner's
-//! standing authority (the send_message action sink posting a relay-signed
-//! kind:9).
+//! visibility/ttl tags, including via the owner-of-agent fallback), message
+//! edits (kind:40003 self-edit and owner-of-agent edit), message deletes
+//! (kind:9005 self-delete and owner-of-agent delete, kind:9008 group delete
+//! via the same fallback), huddle audio admission (speaking is a channel
+//! write, including parent-linked ephemeral huddles), channel-scoped command
+//! events (kind:30620 workflow definitions, kind:41011 DM add-member), NIP-09
+//! kind:5 deletions of addressable and regular targets, and the durable
+//! indirect write a workflow performs through its owner's standing authority
+//! (the send_message action sink posting a relay-signed kind:9).
 //!
 //! The relay's role model (`buzz_core::channel::MemberRole`) defines `Guest`
 //! as a read-only external participant: a guest holds an active
@@ -1892,4 +1893,395 @@ async fn test_guest_cannot_delete_agents_message_kind5() {
     owner.disconnect().await.expect("disconnect owner");
     agent.disconnect().await.expect("disconnect agent");
     guest.disconnect().await.expect("disconnect guest");
+}
+
+/// A guest must not be able to modify privileged channel metadata
+/// (kind:9002 name/about/archived/visibility/ttl) through the owner-of-agent
+/// fallback: owning an owner-role agent in the channel must not lift the
+/// guest read-only restriction.
+#[tokio::test]
+#[ignore]
+async fn test_guest_cannot_edit_privileged_metadata_via_owned_owner_agent() {
+    let url = relay_url();
+    let community_id = ensure_test_community().await;
+    let owner_keys = Keys::generate();
+    let agent_keys = Keys::generate();
+    let guest_keys = Keys::generate();
+
+    let mut owner = buzz_test_client::BuzzTestClient::connect(&url, &owner_keys)
+        .await
+        .expect("connect as owner");
+    let channel_id = create_channel_ws(&mut owner, &owner_keys, "private").await;
+
+    // The agent holds the owner role in the channel...
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &agent_keys.public_key().to_hex(),
+        Some("owner"),
+        &owner_keys,
+    )
+    .await;
+    assert!(accepted, "owner should add agent as owner, got: {msg}");
+
+    // ...and the guest human owns the agent.
+    let pool = e2e_db_pool().await;
+    seed_agent_owner(&pool, community_id, &agent_keys, &guest_keys).await;
+
+    // The guest is a read-only channel participant.
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &guest_keys.public_key().to_hex(),
+        Some("guest"),
+        &owner_keys,
+    )
+    .await;
+    assert!(accepted, "owner should add guest, got: {msg}");
+
+    let mut guest = buzz_test_client::BuzzTestClient::connect(&url, &guest_keys)
+        .await
+        .expect("connect as guest");
+    let rename = EventBuilder::new(Kind::Custom(9002), "")
+        .tags(vec![
+            Tag::parse(["h", &channel_id]).unwrap(),
+            Tag::parse(["name", "guest-takeover-name"]).unwrap(),
+        ])
+        .sign_with_keys(&guest_keys)
+        .unwrap();
+    let ok = guest
+        .send_event(rename)
+        .await
+        .expect("guest privileged kind:9002 publish");
+    assert!(
+        !ok.accepted,
+        "guest privileged kind:9002 edit via owned owner agent must be rejected, but it was accepted: {}",
+        ok.message
+    );
+    assert!(
+        ok.message.contains("guest") || ok.message.contains("read-only"),
+        "rejection should name the guest read-only restriction, got: {}",
+        ok.message
+    );
+
+    // Control: the owner-role agent's own privileged edit is still accepted —
+    // the fallback fix must not over-deny legitimate owners.
+    let mut agent = buzz_test_client::BuzzTestClient::connect(&url, &agent_keys)
+        .await
+        .expect("connect as agent");
+    let agent_rename = EventBuilder::new(Kind::Custom(9002), "")
+        .tags(vec![
+            Tag::parse(["h", &channel_id]).unwrap(),
+            Tag::parse(["name", "agent-owner-rename"]).unwrap(),
+        ])
+        .sign_with_keys(&agent_keys)
+        .unwrap();
+    let ok = agent
+        .send_event(agent_rename)
+        .await
+        .expect("agent kind:9002 publish");
+    assert!(
+        ok.accepted,
+        "owner-role agent kind:9002 must be accepted: {}",
+        ok.message
+    );
+
+    owner.disconnect().await.expect("disconnect owner");
+    guest.disconnect().await.expect("disconnect guest");
+    agent.disconnect().await.expect("disconnect agent");
+}
+
+/// A guest owning an agent must not be able to kind:40003-edit the agent's
+/// messages: the ownership fallback re-gates the actor's fresh roles first.
+#[tokio::test]
+#[ignore]
+async fn test_guest_cannot_edit_agents_message() {
+    let url = relay_url();
+    let community_id = ensure_test_community().await;
+    let owner_keys = Keys::generate();
+    let agent_keys = Keys::generate();
+    let guest_keys = Keys::generate();
+
+    let mut owner = buzz_test_client::BuzzTestClient::connect(&url, &owner_keys)
+        .await
+        .expect("connect as owner");
+    let channel_id = create_channel_ws(&mut owner, &owner_keys, "open").await;
+
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &guest_keys.public_key().to_hex(),
+        Some("guest"),
+        &owner_keys,
+    )
+    .await;
+    assert!(accepted, "owner should add guest, got: {msg}");
+
+    let pool = e2e_db_pool().await;
+    seed_agent_owner(&pool, community_id, &agent_keys, &guest_keys).await;
+
+    let mut agent = buzz_test_client::BuzzTestClient::connect(&url, &agent_keys)
+        .await
+        .expect("connect as agent");
+    let ok = agent
+        .send_event(stream_message(&agent_keys, &channel_id, "agent original"))
+        .await
+        .expect("agent kind:9 publish");
+    assert!(ok.accepted, "agent kind:9 must be accepted: {}", ok.message);
+
+    let mut guest = buzz_test_client::BuzzTestClient::connect(&url, &guest_keys)
+        .await
+        .expect("connect as guest");
+    let ok = guest
+        .send_event(stream_message_edit(
+            &guest_keys,
+            &channel_id,
+            &ok.event_id,
+            "guest takeover edit",
+        ))
+        .await
+        .expect("guest kind:40003 publish");
+    assert!(
+        !ok.accepted,
+        "guest must not edit the agent's message via the ownership fallback, but it was accepted: {}",
+        ok.message
+    );
+    assert!(
+        ok.message.contains("guest") || ok.message.contains("read-only"),
+        "rejection should name the guest read-only restriction, got: {}",
+        ok.message
+    );
+
+    // Control: the agent editing its own message stays allowed.
+    let mut agent_client = buzz_test_client::BuzzTestClient::connect(&url, &agent_keys)
+        .await
+        .expect("connect as agent again");
+    let ok = agent_client
+        .send_event(stream_message(&agent_keys, &channel_id, "agent control"))
+        .await
+        .expect("agent control kind:9 publish");
+    assert!(
+        ok.accepted,
+        "agent control kind:9 must be accepted: {}",
+        ok.message
+    );
+    let ok = agent_client
+        .send_event(stream_message_edit(
+            &agent_keys,
+            &channel_id,
+            &ok.event_id,
+            "agent self edit",
+        ))
+        .await
+        .expect("agent kind:40003 publish");
+    assert!(
+        ok.accepted,
+        "agent self-edit must be accepted: {}",
+        ok.message
+    );
+
+    owner.disconnect().await.expect("disconnect owner");
+    agent.disconnect().await.expect("disconnect agent");
+    guest.disconnect().await.expect("disconnect guest");
+    agent_client
+        .disconnect()
+        .await
+        .expect("disconnect agent control");
+}
+
+/// A guest owning an owner-role agent must not be able to kind:9005-delete the
+/// agent's messages.
+#[tokio::test]
+#[ignore]
+async fn test_guest_cannot_delete_agents_message_9005() {
+    let url = relay_url();
+    let community_id = ensure_test_community().await;
+    let owner_keys = Keys::generate();
+    let agent_keys = Keys::generate();
+    let guest_keys = Keys::generate();
+
+    let mut owner = buzz_test_client::BuzzTestClient::connect(&url, &owner_keys)
+        .await
+        .expect("connect as owner");
+    let channel_id = create_channel_ws(&mut owner, &owner_keys, "open").await;
+
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &guest_keys.public_key().to_hex(),
+        Some("guest"),
+        &owner_keys,
+    )
+    .await;
+    assert!(accepted, "owner should add guest, got: {msg}");
+
+    let pool = e2e_db_pool().await;
+    seed_agent_owner(&pool, community_id, &agent_keys, &guest_keys).await;
+
+    let mut agent = buzz_test_client::BuzzTestClient::connect(&url, &agent_keys)
+        .await
+        .expect("connect as agent");
+    let ok = agent
+        .send_event(stream_message(
+            &agent_keys,
+            &channel_id,
+            "agent message 9005",
+        ))
+        .await
+        .expect("agent kind:9 publish");
+    assert!(ok.accepted, "agent kind:9 must be accepted: {}", ok.message);
+    let target_id = ok.event_id;
+
+    let mut guest = buzz_test_client::BuzzTestClient::connect(&url, &guest_keys)
+        .await
+        .expect("connect as guest");
+    let ok = guest
+        .send_event(delete_event(&guest_keys, &channel_id, &target_id))
+        .await
+        .expect("guest kind:9005 publish");
+    assert!(
+        !ok.accepted,
+        "guest must not delete the agent's message via kind:9005, but it was accepted: {}",
+        ok.message
+    );
+    assert!(
+        ok.message.contains("guest") || ok.message.contains("read-only"),
+        "rejection should name the guest read-only restriction, got: {}",
+        ok.message
+    );
+
+    // Control: the channel owner deleting the agent's message stays allowed.
+    let ok = owner
+        .send_event(delete_event(&owner_keys, &channel_id, &target_id))
+        .await
+        .expect("owner kind:9005 publish");
+    assert!(
+        ok.accepted,
+        "owner kind:9005 delete must be accepted: {}",
+        ok.message
+    );
+
+    owner.disconnect().await.expect("disconnect owner");
+    agent.disconnect().await.expect("disconnect agent");
+    guest.disconnect().await.expect("disconnect guest");
+}
+
+/// A guest owning an owner-role agent must not be able to kind:9008-delete the
+/// channel through the ownership fallback.
+#[tokio::test]
+#[ignore]
+async fn test_guest_cannot_delete_group_via_owned_agent() {
+    let url = relay_url();
+    let community_id = ensure_test_community().await;
+    let owner_keys = Keys::generate();
+    let agent_keys = Keys::generate();
+    let guest_keys = Keys::generate();
+    let fallback_agent_keys = Keys::generate();
+    let fallback_human_keys = Keys::generate();
+
+    let mut owner = buzz_test_client::BuzzTestClient::connect(&url, &owner_keys)
+        .await
+        .expect("connect as owner");
+    let channel_id = create_channel_ws(&mut owner, &owner_keys, "private").await;
+
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &agent_keys.public_key().to_hex(),
+        Some("owner"),
+        &owner_keys,
+    )
+    .await;
+    assert!(accepted, "owner should add agent as owner, got: {msg}");
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &guest_keys.public_key().to_hex(),
+        Some("guest"),
+        &owner_keys,
+    )
+    .await;
+    assert!(accepted, "owner should add guest, got: {msg}");
+
+    let pool = e2e_db_pool().await;
+    seed_agent_owner(&pool, community_id, &agent_keys, &guest_keys).await;
+    seed_agent_owner(
+        &pool,
+        community_id,
+        &fallback_agent_keys,
+        &fallback_human_keys,
+    )
+    .await;
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &fallback_agent_keys.public_key().to_hex(),
+        Some("owner"),
+        &owner_keys,
+    )
+    .await;
+    assert!(
+        accepted,
+        "owner should add fallback agent as owner, got: {msg}"
+    );
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &fallback_human_keys.public_key().to_hex(),
+        Some("member"),
+        &owner_keys,
+    )
+    .await;
+    assert!(
+        accepted,
+        "owner should add fallback human as member, got: {msg}"
+    );
+
+    let mut guest = buzz_test_client::BuzzTestClient::connect(&url, &guest_keys)
+        .await
+        .expect("connect as guest");
+    let event = EventBuilder::new(Kind::Custom(9008), "")
+        .tags(vec![Tag::parse(["h", &channel_id]).unwrap()])
+        .sign_with_keys(&guest_keys)
+        .unwrap();
+    let ok = guest
+        .send_event(event)
+        .await
+        .expect("guest kind:9008 publish");
+    assert!(
+        !ok.accepted,
+        "guest must not delete the group via the owned owner agent, but it was accepted: {}",
+        ok.message
+    );
+    assert!(
+        ok.message.contains("guest") || ok.message.contains("read-only"),
+        "rejection should name the guest read-only restriction, got: {}",
+        ok.message
+    );
+
+    // Control: a non-guest owning human (a plain member, not owner/admin)
+    // keeps the ownership fallback — kind:9008 stays allowed for them.
+    let mut fallback_human = buzz_test_client::BuzzTestClient::connect(&url, &fallback_human_keys)
+        .await
+        .expect("connect as fallback human");
+    let event = EventBuilder::new(Kind::Custom(9008), "")
+        .tags(vec![Tag::parse(["h", &channel_id]).unwrap()])
+        .sign_with_keys(&fallback_human_keys)
+        .unwrap();
+    let ok = fallback_human
+        .send_event(event)
+        .await
+        .expect("fallback human kind:9008 publish");
+    assert!(
+        ok.accepted,
+        "non-guest owner-of-agent kind:9008 must stay allowed: {}",
+        ok.message
+    );
+
+    owner.disconnect().await.expect("disconnect owner");
+    guest.disconnect().await.expect("disconnect guest");
+    fallback_human
+        .disconnect()
+        .await
+        .expect("disconnect fallback human");
 }

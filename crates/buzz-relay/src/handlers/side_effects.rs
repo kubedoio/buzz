@@ -669,7 +669,17 @@ pub async fn validate_admin_event(
                     _ => {
                         // Allow the owning human of any active owner-role agent in the
                         // channel, even when the human is not a channel member —
-                        // diverges from kind:9001 intentionally.
+                        // diverges from kind:9001 intentionally. The ownership
+                        // fallback must not lift the guest read-only
+                        // restriction: probe the actor's fresh roles first.
+                        super::ingest::check_not_guest_identity(
+                            tenant.community(),
+                            state,
+                            Some(channel_id),
+                            &actor_bytes,
+                        )
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
                         if actor_owns_any_owner_agent(
                             state,
                             tenant.community(),
@@ -780,7 +790,17 @@ pub async fn validate_admin_event(
                 Ok(())
             } else {
                 // Allow the owning human of the agent that authored the target message,
-                // even when the human is not a channel member.
+                // even when the human is not a channel member. The ownership
+                // fallback must not lift the guest read-only restriction:
+                // probe the actor's fresh roles first.
+                super::ingest::check_not_guest_identity(
+                    tenant.community(),
+                    state,
+                    Some(channel_id),
+                    &actor_bytes,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
                 if state
                     .db
                     .is_agent_owner(tenant.community(), &author, &actor_bytes)
@@ -803,7 +823,17 @@ pub async fn validate_admin_event(
                 _ => {
                     // Allow the owning human of any active owner-role agent in the
                     // channel, even when the human is not a channel member —
-                    // diverges from kind:9001 intentionally.
+                    // diverges from kind:9001 intentionally. The ownership
+                    // fallback must not lift the guest read-only restriction:
+                    // probe the actor's fresh roles first.
+                    super::ingest::check_not_guest_identity(
+                        tenant.community(),
+                        state,
+                        Some(channel_id),
+                        &actor_bytes,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                     if actor_owns_any_owner_agent(state, tenant.community(), &members, &actor_bytes)
                         .await?
                     {
