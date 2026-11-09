@@ -242,15 +242,59 @@ pub async fn validate_standard_deletion_event(
         if parts.len() < 2 {
             return Err(anyhow::anyhow!("invalid a-tag format"));
         }
+        let target_kind: i32 = parts[0]
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid kind in a-tag"))?;
         let target_pubkey_bytes =
             hex::decode(parts[1]).map_err(|_| anyhow::anyhow!("invalid pubkey in a-tag"))?;
-        if target_pubkey_bytes != actor_bytes
-            && !state
+        let d_tag = parts.get(2).copied().unwrap_or("");
+
+        // Resolve the addressable target where a live row exists. kind:5 is
+        // not in requires_h_channel_scope, so a-tag-only deletions never pass
+        // the generic ingest write gate — channel-scoped targets must re-gate
+        // the actor's current role here instead.
+        let target_channel = state
+            .db
+            .get_event_by_coordinate(tenant.community(), target_kind, &target_pubkey_bytes, d_tag)
+            .await?
+            .and_then(|t| t.channel_id);
+
+        if target_pubkey_bytes != actor_bytes {
+            // Owning human of the author agent. The ownership fallback must
+            // not lift the guest read-only restriction: probe fresh roles
+            // first (relay level only when the target is channel-less).
+            super::ingest::check_not_guest_identity(
+                tenant.community(),
+                state,
+                target_channel,
+                &actor_bytes,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if !state
                 .db
                 .is_agent_owner(tenant.community(), &target_pubkey_bytes, &actor_bytes)
                 .await?
-        {
-            return Err(anyhow::anyhow!("must be event author"));
+            {
+                return Err(anyhow::anyhow!("must be event author"));
+            }
+            return Ok(());
+        }
+
+        // Author self-deletion: mirror the kind:9005 author re-gate — a
+        // downgraded guest must not be able to delete their own pre-downgrade
+        // addressable events, and a removed member loses the ability on
+        // private channels immediately.
+        if let Some(ch) = target_channel {
+            super::ingest::check_channel_write_role(
+                tenant.community(),
+                state,
+                ch,
+                &actor_bytes,
+                None,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         return Ok(());
     }
@@ -264,13 +308,38 @@ pub async fn validate_standard_deletion_event(
 
         let target_author =
             effective_message_author(&target_event.event, &state.relay_keypair.public_key());
-        if target_author != actor_bytes
-            && !state
+        if target_author != actor_bytes {
+            // Owning human of the message's agent author — the ownership
+            // fallback must not lift the guest read-only restriction.
+            super::ingest::check_not_guest_identity(
+                tenant.community(),
+                state,
+                target_event.channel_id,
+                &actor_bytes,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if !state
                 .db
                 .is_agent_owner(tenant.community(), &target_author, &actor_bytes)
                 .await?
-        {
-            return Err(anyhow::anyhow!("must be event author"));
+            {
+                return Err(anyhow::anyhow!("must be event author"));
+            }
+        } else if let Some(ch) = target_event.channel_id {
+            // Author self-deletion of a channel-scoped target: mirror the
+            // kind:9005 author re-gate so the validator itself re-reads the
+            // current role (the generic ingest gate also covers e-tag
+            // channel-scoped deletions; this keeps the rule at the door).
+            super::ingest::check_channel_write_role(
+                tenant.community(),
+                state,
+                ch,
+                &actor_bytes,
+                None,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
     }
 

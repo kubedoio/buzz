@@ -1036,6 +1036,34 @@ pub async fn get_event_by_id_including_deleted(
     }
 }
 
+/// Fetch the newest live (non-deleted) row for an addressable coordinate
+/// `(kind, pubkey, d_tag)`. Used to resolve kind:5 `a`-tag deletion targets
+/// to their channel for write-role re-gating; `None` when no live row exists.
+pub async fn get_event_by_coordinate(
+    pool: &PgPool,
+    community_id: CommunityId,
+    kind: i32,
+    pubkey: &[u8],
+    d_tag: &str,
+) -> Result<Option<StoredEvent>> {
+    let row = sqlx::query(
+        "SELECT id, pubkey, created_at, kind, tags, content, sig, received_at, channel_id \
+         FROM events WHERE community_id = $1 AND kind = $2 AND pubkey = $3 AND d_tag = $4 \
+         AND deleted_at IS NULL ORDER BY created_at DESC LIMIT 1",
+    )
+    .bind(community_id.as_uuid())
+    .bind(kind)
+    .bind(pubkey)
+    .bind(d_tag)
+    .fetch_optional(pool)
+    .await?;
+
+    match row {
+        Some(r) => row_to_stored_event(r),
+        None => Ok(None),
+    }
+}
+
 /// Batch-fetch non-deleted events by their raw 32-byte IDs.
 ///
 /// Returns events in arbitrary order — callers reorder as needed.

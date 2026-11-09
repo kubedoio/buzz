@@ -4091,6 +4091,18 @@ impl Db {
         relay_members::add_relay_member(&self.pool, community, pubkey, role, added_by).await
     }
 
+    /// Fetch the newest live row for an addressable coordinate. Used to
+    /// resolve kind:5 `a`-tag deletion targets to their channel.
+    pub async fn get_event_by_coordinate(
+        &self,
+        community_id: CommunityId,
+        kind: i32,
+        pubkey: &[u8],
+        d_tag: &str,
+    ) -> Result<Option<buzz_core::StoredEvent>> {
+        event::get_event_by_coordinate(&self.pool, community_id, kind, pubkey, d_tag).await
+    }
+
     /// Claims relay membership via an invite and atomically persists the
     /// accepted policy version when a policy is configured.
     pub async fn claim_relay_membership(

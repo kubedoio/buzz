@@ -274,12 +274,16 @@ async fn handle_active_audio_connection(
         Ok(parent_id) => parent_id,
         Err(e) => {
             warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "audio membership denied: {e}");
+            // Surface the guest read-only reason distinctly so clients and
+            // tests can tell a guest denial apart from a generic refusal;
+            // other internal failures stay behind the generic message.
+            let payload = if e.starts_with("restricted: guest") {
+                serde_json::json!({"type":"error","message":"not a member","reason":e})
+            } else {
+                serde_json::json!({"type":"error","message":"not a member"})
+            };
             let _ = ws_send
-                .send(WsMessage::Text(
-                    serde_json::json!({"type":"error","message":"not a member"})
-                        .to_string()
-                        .into(),
-                ))
+                .send(WsMessage::Text(payload.to_string().into()))
                 .await;
             return;
         }
@@ -1169,6 +1173,17 @@ async fn ensure_membership(
         return Err("channel is archived".into());
     }
 
+    // Speaking in a huddle is a channel write: a guest-role identity must be
+    // refused here, before the membership fast path, the open-channel
+    // fallback, or the ephemeral parent auto-add can admit it.
+    crate::handlers::ingest::check_not_guest_identity(
+        tenant.community(),
+        state,
+        Some(channel_id),
+        pubkey_bytes,
+    )
+    .await?;
+
     // Lifecycle events for an ephemeral huddle belong in its parent channel.
     // Resolve that parent from a creator-signed kind:48100 event instead of
     // trusting the UUID supplied by the client during audio auth.
@@ -1191,6 +1206,21 @@ async fn ensure_membership(
     } else {
         channel_id
     };
+
+    // Ephemeral admission derives from the PARENT channel: the auto-add path
+    // below only checks parent row presence, and a parent without an explicit
+    // visibility tag defaults its huddles to open — either would admit a
+    // parent-guest untouched by the huddle-channel probe above. Probe the
+    // parent's fresh roles too before any admission path can run.
+    if lifecycle_parent_id != channel_id {
+        crate::handlers::ingest::check_not_guest_identity(
+            tenant.community(),
+            state,
+            Some(lifecycle_parent_id),
+            pubkey_bytes,
+        )
+        .await?;
+    }
 
     // Fast path: already a member.
     let is_member = state
