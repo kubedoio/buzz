@@ -1,10 +1,13 @@
 //! Regression tests for guest-role write authorization on channel-scoped
 //! writes: channel messages (kind:9 / KIND_STREAM_MESSAGE), channel metadata
-//! edits (kind:9002 topic/purpose), message edits (kind:40003 self-edit),
-//! message deletes (kind:9005 self-delete), channel-scoped command events
-//! (kind:30620 workflow definitions, kind:41011 DM add-member), and the
-//! durable indirect write a workflow performs through its owner's standing
-//! authority (the send_message action sink posting a relay-signed kind:9).
+//! edits (kind:9002 topic/purpose and the privileged name/about/archived/
+//! visibility/ttl tags, including via the owner-of-agent fallback), message
+//! edits (kind:40003 self-edit and owner-of-agent edit), message deletes
+//! (kind:9005 self-delete), huddle audio admission (speaking is a channel
+//! write), channel-scoped command events (kind:30620 workflow definitions,
+//! kind:41011 DM add-member), and the durable indirect write a workflow
+//! performs through its owner's standing authority (the send_message action
+//! sink posting a relay-signed kind:9).
 //!
 //! The relay's role model (`buzz_core::channel::MemberRole`) defines `Guest`
 //! as a read-only external participant: a guest holds an active
@@ -1363,4 +1366,217 @@ async fn test_guest_channel_command_denied_member_dm_command_allowed() {
     owner.disconnect().await.expect("disconnect owner");
     member.disconnect().await.expect("disconnect member");
     guest.disconnect().await.expect("disconnect guest");
+}
+
+/// A guest must not be able to modify privileged channel metadata
+/// (kind:9002 name/about/archived/visibility/ttl) through the owner-of-agent
+/// fallback: owning an owner-role agent in the channel must not lift the
+/// guest read-only restriction.
+#[tokio::test]
+#[ignore]
+async fn test_guest_cannot_edit_privileged_metadata_via_owned_owner_agent() {
+    let url = relay_url();
+    let community_id = ensure_test_community().await;
+    let owner_keys = Keys::generate();
+    let agent_keys = Keys::generate();
+    let guest_keys = Keys::generate();
+
+    let mut owner = buzz_test_client::BuzzTestClient::connect(&url, &owner_keys)
+        .await
+        .expect("connect as owner");
+    let channel_id = create_channel_ws(&mut owner, &owner_keys, "private").await;
+
+    // The agent holds the owner role in the channel...
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &agent_keys.public_key().to_hex(),
+        Some("owner"),
+        &owner_keys,
+    )
+    .await;
+    assert!(accepted, "owner should add agent as owner, got: {msg}");
+
+    // ...and the guest human owns the agent. The guest's own users row must
+    // exist first: agent_owner_pubkey is a self-referencing foreign key.
+    let pool = e2e_db_pool().await;
+    sqlx::query(
+        "INSERT INTO users (community_id, pubkey) \
+         VALUES ($1, $2) \
+         ON CONFLICT (community_id, pubkey) DO NOTHING",
+    )
+    .bind(community_id)
+    .bind(guest_keys.public_key().to_bytes())
+    .execute(&pool)
+    .await
+    .expect("seed guest user row");
+    sqlx::query(
+        "INSERT INTO users (community_id, pubkey, agent_owner_pubkey) \
+         VALUES ($1, $2, $3) \
+         ON CONFLICT (community_id, pubkey) \
+         DO UPDATE SET agent_owner_pubkey = EXCLUDED.agent_owner_pubkey",
+    )
+    .bind(community_id)
+    .bind(agent_keys.public_key().to_bytes())
+    .bind(guest_keys.public_key().to_bytes())
+    .execute(&pool)
+    .await
+    .expect("seed agent ownership");
+
+    // The guest is a read-only channel participant.
+    let (accepted, msg) = put_user_ws(
+        &mut owner,
+        &channel_id,
+        &guest_keys.public_key().to_hex(),
+        Some("guest"),
+        &owner_keys,
+    )
+    .await;
+    assert!(accepted, "owner should add guest, got: {msg}");
+
+    let mut guest = buzz_test_client::BuzzTestClient::connect(&url, &guest_keys)
+        .await
+        .expect("connect as guest");
+    let rename = EventBuilder::new(Kind::Custom(9002), "")
+        .tags(vec![
+            Tag::parse(["h", &channel_id]).unwrap(),
+            Tag::parse(["name", "guest-takeover-name"]).unwrap(),
+        ])
+        .sign_with_keys(&guest_keys)
+        .unwrap();
+    let ok = guest
+        .send_event(rename)
+        .await
+        .expect("guest privileged kind:9002 publish");
+    assert!(
+        !ok.accepted,
+        "guest privileged kind:9002 edit via owned owner agent must be rejected, but it was accepted: {}",
+        ok.message
+    );
+    assert!(
+        ok.message.contains("guest") || ok.message.contains("read-only"),
+        "rejection should name the guest read-only restriction, got: {}",
+        ok.message
+    );
+
+    // Control: the owner-role agent's own privileged edit is still accepted —
+    // the fallback fix must not over-deny legitimate owners.
+    let mut agent = buzz_test_client::BuzzTestClient::connect(&url, &agent_keys)
+        .await
+        .expect("connect as agent");
+    let agent_rename = EventBuilder::new(Kind::Custom(9002), "")
+        .tags(vec![
+            Tag::parse(["h", &channel_id]).unwrap(),
+            Tag::parse(["name", "agent-owner-rename"]).unwrap(),
+        ])
+        .sign_with_keys(&agent_keys)
+        .unwrap();
+    let ok = agent
+        .send_event(agent_rename)
+        .await
+        .expect("agent kind:9002 publish");
+    assert!(
+        ok.accepted,
+        "owner-role agent kind:9002 must be accepted: {}",
+        ok.message
+    );
+
+    owner.disconnect().await.expect("disconnect owner");
+    guest.disconnect().await.expect("disconnect guest");
+    agent.disconnect().await.expect("disconnect agent");
+}
+
+/// A guest must not be able to join a huddle audio channel, even though it
+/// holds an active channel membership row: speaking in a huddle is a channel
+/// write, and the audio admission path must enforce the same read-only rule
+/// as the event write gate (fresh role read at join time).
+#[tokio::test]
+#[ignore]
+async fn test_guest_cannot_join_audio_huddle() {
+    let url = relay_url();
+    ensure_test_community().await;
+    let owner_keys = Keys::generate();
+    let guest_keys = Keys::generate();
+    let member_keys = Keys::generate();
+
+    let mut owner = buzz_test_client::BuzzTestClient::connect(&url, &owner_keys)
+        .await
+        .expect("connect as owner");
+    let channel_id = create_channel_ws(&mut owner, &owner_keys, "private").await;
+
+    for (keys, role) in [(&guest_keys, "guest"), (&member_keys, "member")] {
+        let (accepted, msg) = put_user_ws(
+            &mut owner,
+            &channel_id,
+            &keys.public_key().to_hex(),
+            Some(role),
+            &owner_keys,
+        )
+        .await;
+        assert!(accepted, "owner should add {role}, got: {msg}");
+    }
+
+    let audio_url = format!("{}/huddle/{}/audio", url, channel_id);
+
+    // Guest: completes NIP-42 auth, then must be refused at membership.
+    let reply = huddle_handshake(&audio_url, &url, &guest_keys).await;
+    assert!(
+        reply.contains("\"error\"") && reply.contains("not a member"),
+        "guest audio join must be refused with the membership error, got: {reply}"
+    );
+
+    // Control: a member completing the same handshake is admitted (receives
+    // the joined frame), so the guest refusal is not a blanket audio outage.
+    let reply = huddle_handshake(&audio_url, &url, &member_keys).await;
+    assert!(
+        reply.contains("\"joined\""),
+        "member audio join must proceed to joined, got: {reply}"
+    );
+
+    owner.disconnect().await.expect("disconnect owner");
+}
+
+/// Drive the huddle audio WebSocket handshake through NIP-42 auth and return
+/// the first post-auth text frame: the error payload on refusal, or the
+/// joined frame on admission.
+async fn huddle_handshake(audio_url: &str, relay_url: &str, keys: &Keys) -> String {
+    use futures_util::{SinkExt, StreamExt};
+
+    let (mut ws, _) = tokio_tungstenite::connect_async(audio_url)
+        .await
+        .expect("connect audio ws");
+    let challenge_frame = ws
+        .next()
+        .await
+        .expect("challenge frame")
+        .expect("challenge ok");
+    let challenge_json: serde_json::Value =
+        serde_json::from_str(challenge_frame.to_text().expect("challenge text"))
+            .expect("challenge json");
+    assert_eq!(challenge_json["type"], "challenge");
+    let challenge = challenge_json["challenge"]
+        .as_str()
+        .expect("challenge string")
+        .to_string();
+
+    let auth_event =
+        buzz_ws_client::build_auth_event(&challenge, relay_url, keys, None).expect("auth event");
+    let auth_msg = serde_json::json!({"type": "auth", "event": auth_event, "protocol_version": 1});
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        auth_msg.to_string().into(),
+    ))
+    .await
+    .expect("send auth");
+
+    tokio::time::timeout(std::time::Duration::from_secs(15), async {
+        while let Some(frame) = ws.next().await {
+            let frame = frame.expect("post-auth frame");
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = frame {
+                return text.to_string();
+            }
+        }
+        panic!("audio socket closed without a post-auth text frame");
+    })
+    .await
+    .expect("post-auth frame timeout")
 }

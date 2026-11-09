@@ -1212,6 +1212,17 @@ async fn ensure_membership(
         return Err("channel is archived".into());
     }
 
+    // Speaking in a huddle is a channel write: a guest-role identity must be
+    // refused here, before the membership fast path, the open-channel
+    // fallback, or the ephemeral parent auto-add can admit it.
+    crate::handlers::ingest::check_not_guest_identity(
+        tenant.community(),
+        state,
+        channel_id,
+        pubkey_bytes,
+    )
+    .await?;
+
     // Lifecycle events for an ephemeral huddle belong in its parent channel.
     // Resolve that parent from a creator-signed kind:48100 event instead of
     // trusting the UUID supplied by the client during audio auth.

@@ -687,6 +687,42 @@ pub(crate) async fn check_channel_write_role(
     }
 }
 
+/// Fresh identity-level guest probe for write surfaces the channel write gate
+/// does not cover (audio huddle admission, the owner-of-agent fallbacks in the
+/// per-kind admin validators). Denies when the actor holds the guest role in
+/// the named channel or at relay level; every other identity — including
+/// non-members, who keep their documented admission flows — passes. Both role
+/// reads are fresh primary-database reads, matching `check_channel_write_role`:
+/// no cached permission survives a member→guest downgrade.
+pub(crate) async fn check_not_guest_identity(
+    community_id: CommunityId,
+    state: &AppState,
+    channel_id: Uuid,
+    pubkey_bytes: &[u8],
+) -> Result<(), String> {
+    if let Some(role) = state
+        .db
+        .get_member_role(community_id, channel_id, pubkey_bytes)
+        .await
+        .map_err(|e| format!("error: database error: {e}"))?
+    {
+        if role == "guest" {
+            return Err("restricted: guest members are read-only".to_string());
+        }
+    }
+    if let Some(member) = state
+        .db
+        .get_relay_member(community_id, &hex::encode(pubkey_bytes))
+        .await
+        .map_err(|e| format!("error: database error: {e}"))?
+    {
+        if member.role == "guest" {
+            return Err("restricted: guest members are read-only".to_string());
+        }
+    }
+    Ok(())
+}
+
 fn check_token_channel_access(auth: &IngestAuth, channel_id: Uuid) -> Result<(), String> {
     if let Some(allowed) = auth.channel_ids() {
         if !allowed.contains(&channel_id) {
@@ -982,6 +1018,13 @@ async fn validate_edit_ownership(
         }
     } else {
         // Allow the owning human to edit messages authored by their agent.
+        // The ownership fallback must not lift the guest read-only
+        // restriction: probe the actor's fresh roles before consulting
+        // ownership (the generic gate skips this kind; per-kind validators
+        // are the authority).
+        if let Some(ch_id) = target_event.channel_id {
+            check_not_guest_identity(community_id, state, ch_id, &actor).await?;
+        }
         let is_owner = state
             .db
             .is_agent_owner(community_id, &author, &actor)
