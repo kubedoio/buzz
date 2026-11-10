@@ -138,7 +138,9 @@ impl WorkflowEngine {
     /// the definition was saved, so every run-creation door must recheck the
     /// owner's *current* channel authority immediately before creating a run:
     ///
-    /// - the owner must still be an active member of the workflow's channel;
+    /// - the owner must still hold a write-capable role (`owner`/`admin`/
+    ///   `member`/`bot`) in the workflow's channel — a `guest` is a read-only
+    ///   participant and denies exactly like a non-member;
     /// - if the definition contains an exfiltration-capable action
     ///   (`call_webhook`), the owner must currently hold the `owner` or
     ///   `admin` role.
@@ -1023,11 +1025,15 @@ pub fn build_trigger_context(event: &buzz_core::StoredEvent) -> executor::Trigge
 ///
 /// Rules:
 /// - not a member ⇒ deny, always;
+/// - `guest` ⇒ deny, always — a guest is a read-only participant and must not
+///   wield the workflow's standing write authority, however harmless the
+///   definition looks;
 /// - member ⇒ allowed for ordinary definitions;
 /// - elevated definitions ⇒ only `owner` / `admin` roles.
 fn owner_authority_allows(role: Option<&str>, needs_elevated: bool) -> bool {
     match role {
         None => false,
+        Some("guest") => false,
         Some(r) if needs_elevated => matches!(r, "owner" | "admin"),
         Some(_) => true,
     }
@@ -1671,10 +1677,20 @@ steps:
     }
 
     #[test]
+    fn owner_authority_denies_guest_always() {
+        // Guests are read-only participants: they must not wield a workflow's
+        // standing write authority, whatever the definition requires.
+        assert!(!owner_authority_allows(Some("guest"), false));
+        assert!(!owner_authority_allows(Some("guest"), true));
+    }
+
+    #[test]
     fn owner_authority_allows_any_member_for_ordinary_definitions() {
         assert!(owner_authority_allows(Some("member"), false));
         assert!(owner_authority_allows(Some("admin"), false));
         assert!(owner_authority_allows(Some("owner"), false));
+        // Bot is outside the role hierarchy and keeps its standing grants.
+        assert!(owner_authority_allows(Some("bot"), false));
     }
 
     #[test]

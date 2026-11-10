@@ -274,12 +274,16 @@ async fn handle_active_audio_connection(
         Ok(parent_id) => parent_id,
         Err(e) => {
             warn!(channel_id = %channel_id, pubkey = %pubkey_hex, "audio membership denied: {e}");
+            // Surface the guest read-only reason distinctly so clients and
+            // tests can tell a guest denial apart from a generic refusal;
+            // other internal failures stay behind the generic message.
+            let payload = if e.starts_with("restricted: guest") {
+                serde_json::json!({"type":"error","message":"not a member","reason":e})
+            } else {
+                serde_json::json!({"type":"error","message":"not a member"})
+            };
             let _ = ws_send
-                .send(WsMessage::Text(
-                    serde_json::json!({"type":"error","message":"not a member"})
-                        .to_string()
-                        .into(),
-                ))
+                .send(WsMessage::Text(payload.to_string().into()))
                 .await;
             return;
         }
@@ -667,6 +671,8 @@ async fn handle_active_audio_connection(
         send_cancel,
         Arc::clone(&state),
         tenant.community(),
+        channel_id,
+        parent_id_for_event,
         pubkey,
     ));
 
@@ -788,6 +794,8 @@ async fn handle_active_audio_connection(
         remote_session.as_mut(),
         Arc::clone(&state),
         tenant.community(),
+        channel_id,
+        parent_id_for_event,
         pubkey,
     )
     .await;
@@ -966,6 +974,8 @@ async fn recv_loop(
     mut remote_session: Option<&mut crate::audio::join::RemoteHuddleSession>,
     state: Arc<AppState>,
     community: buzz_core::CommunityId,
+    channel_id: Uuid,
+    parent_channel_id: Uuid,
     pubkey: nostr::PublicKey,
 ) {
     use crate::audio::wire::{FrameHeader, V2_HEADER_LEN};
@@ -977,7 +987,7 @@ async fn recv_loop(
             msg = ws_recv.next() => {
                 match msg {
                     Some(Ok(WsMessage::Binary(data))) => {
-                        if !audio_membership_allowed(&state, community, &pubkey, &cancel).await {
+                        if !audio_membership_allowed(&state, community, channel_id, parent_channel_id, &pubkey, &cancel).await {
                             break;
                         }
                         if data.len() > MAX_AUDIO_FRAME_BYTES {
@@ -1073,6 +1083,7 @@ async fn recv_loop(
 ///
 /// Control frames (Ping, Pong, Close, control JSON) are drained first on every
 /// iteration, so heartbeat pings are never starved by audio backpressure.
+#[allow(clippy::too_many_arguments)]
 async fn send_loop(
     mut ws_send: futures_util::stream::SplitSink<WebSocket, WsMessage>,
     mut data_rx: mpsc::Receiver<WsMessage>,
@@ -1080,12 +1091,23 @@ async fn send_loop(
     cancel: CancellationToken,
     state: Arc<AppState>,
     community: buzz_core::CommunityId,
+    channel_id: Uuid,
+    parent_channel_id: Uuid,
     pubkey: nostr::PublicKey,
 ) {
     loop {
         // Priority: drain all pending control frames before data.
         while let Ok(ctrl_msg) = ctrl_rx.try_recv() {
-            if !audio_membership_allowed(&state, community, &pubkey, &cancel).await {
+            if !audio_membership_allowed(
+                &state,
+                community,
+                channel_id,
+                parent_channel_id,
+                &pubkey,
+                &cancel,
+            )
+            .await
+            {
                 return;
             }
             if ws_send.send(ctrl_msg).await.is_err() {
@@ -1100,11 +1122,11 @@ async fn send_loop(
                 break;
             }
             Some(ctrl_msg) = ctrl_rx.recv() => {
-                if !audio_membership_allowed(&state, community, &pubkey, &cancel).await { break; }
+                if !audio_membership_allowed(&state, community, channel_id, parent_channel_id, &pubkey, &cancel).await { break; }
                 if ws_send.send(ctrl_msg).await.is_err() { break; }
             }
             Some(msg) = data_rx.recv() => {
-                if !audio_membership_allowed(&state, community, &pubkey, &cancel).await { break; }
+                if !audio_membership_allowed(&state, community, channel_id, parent_channel_id, &pubkey, &cancel).await { break; }
                 if ws_send.send(msg).await.is_err() { break; }
             }
         }
@@ -1152,9 +1174,40 @@ async fn audio_forward_loop(
 async fn audio_membership_allowed(
     state: &AppState,
     community: buzz_core::CommunityId,
+    channel_id: Uuid,
+    parent_channel_id: Uuid,
     pubkey: &nostr::PublicKey,
     cancel: &CancellationToken,
 ) -> bool {
+    // A member→guest downgrade does not change authoritative membership
+    // state, and non-opted-in communities read Ok(None) — the v1alpha2 check
+    // alone cannot cut a downgraded guest. Re-probe the guest role fresh per
+    // frame so mid-session revocation lands without waiting for disconnect.
+    if crate::handlers::ingest::check_not_guest_identity(
+        community,
+        state,
+        Some(channel_id),
+        pubkey.as_bytes(),
+    )
+    .await
+    .is_err()
+    {
+        cancel.cancel();
+        return false;
+    }
+    if parent_channel_id != channel_id
+        && crate::handlers::ingest::check_not_guest_identity(
+            community,
+            state,
+            Some(parent_channel_id),
+            pubkey.as_bytes(),
+        )
+        .await
+        .is_err()
+    {
+        cancel.cancel();
+        return false;
+    }
     // shortcut: primary reads per frame; revisit with a proven revocation fence if media load requires it.
     if matches!(
         crate::api::relay_members::check_v1alpha2_membership(state, community, pubkey.as_bytes(),)
@@ -1212,6 +1265,17 @@ async fn ensure_membership(
         return Err("channel is archived".into());
     }
 
+    // Speaking in a huddle is a channel write: a guest-role identity must be
+    // refused here, before the membership fast path, the open-channel
+    // fallback, or the ephemeral parent auto-add can admit it.
+    crate::handlers::ingest::check_not_guest_identity(
+        tenant.community(),
+        state,
+        Some(channel_id),
+        pubkey_bytes,
+    )
+    .await?;
+
     // Lifecycle events for an ephemeral huddle belong in its parent channel.
     // Resolve that parent from a creator-signed kind:48100 event instead of
     // trusting the UUID supplied by the client during audio auth.
@@ -1234,6 +1298,21 @@ async fn ensure_membership(
     } else {
         channel_id
     };
+
+    // Ephemeral admission derives from the PARENT channel: the auto-add path
+    // below only checks parent row presence, and a parent without an explicit
+    // visibility tag defaults its huddles to open — either would admit a
+    // parent-guest untouched by the huddle-channel probe above. Probe the
+    // parent's fresh roles too before any admission path can run.
+    if lifecycle_parent_id != channel_id {
+        crate::handlers::ingest::check_not_guest_identity(
+            tenant.community(),
+            state,
+            Some(lifecycle_parent_id),
+            pubkey_bytes,
+        )
+        .await?;
+    }
 
     // Fast path: already a member.
     let is_member = state

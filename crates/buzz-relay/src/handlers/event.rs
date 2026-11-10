@@ -862,10 +862,10 @@ async fn handle_ephemeral_event(
         // publish/fan-out path below so other relay nodes receive the live delta.
     }
 
-    // Check channel membership before publishing other ephemeral events.
+    // Check channel write authorization before publishing other ephemeral events.
     if let Some(ch_id) = super::ingest::extract_channel_id(&event) {
-        if let Err(msg) = super::ingest::check_channel_membership(
-            &conn.tenant,
+        if let Err(msg) = super::ingest::check_channel_write_role(
+            conn.tenant.community(),
             &state,
             ch_id,
             &pubkey_bytes,

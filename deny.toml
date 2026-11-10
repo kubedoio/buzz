@@ -15,10 +15,22 @@ ignore = [
     # remove these when upstream catches up.
     { id = "RUSTSEC-2026-0194", reason = "transitive via rust-s3 and mesh-llm→plist; trusted-input XML only; no upstream fix available yet" },
     { id = "RUSTSEC-2026-0195", reason = "transitive via rust-s3 and mesh-llm→plist; trusted-input XML only; no upstream fix available yet" },
-    # nostr-relay-pool is pulled by the pinned mesh-llm/nostr-sdk 0.44 line;
-    # the advisory has no safe upgrade for this release. Keep the exception
-    # explicit until the mesh dependency line moves to nostr-sdk >= 0.45.
-    { id = "RUSTSEC-2026-0243", reason = "transitive via pinned mesh-llm → nostr-sdk 0.44; no safe upgrade available in this relay release" },
+    # SQLite 3.53.2 is bundled by Mesh-LLM 0.78.1's rusqlite 0.40; the fixed
+    # libsqlite3-sys 0.39 requires a Mesh dependency update.
+    { id = "RUSTSEC-2026-0459", reason = "transitive via pinned Mesh-LLM rusqlite 0.40; no semver-compatible fix in current Mesh release" },
+    # Mesh-LLM 0.78.1 uses zip 8.6. Its plugin and updater extractors validate
+    # enclosed paths and copy entries manually; neither calls the affected extract APIs.
+    { id = "RUSTSEC-2026-0367", reason = "transitive via Mesh-LLM zip 8.6; affected extract APIs are not used by the pinned Mesh code" },
+    { id = "RUSTSEC-2026-0368", reason = "transitive via Mesh-LLM zip 8.6; affected extract APIs are not used by the pinned Mesh code" },
+    { id = "RUSTSEC-2026-0369", reason = "transitive via Mesh-LLM zip 8.6; affected extract APIs are not used by the pinned Mesh code" },
+    { id = "RUSTSEC-2026-0429", reason = "transitive via Mesh-LLM zip 8.6; affected extract APIs are not used by the pinned Mesh code" },
+    # Keyring transitively uses zbus 5; these crates were merged into zbus 6,
+    # which requires a coordinated keyring/Mesh upgrade.
+    { id = "RUSTSEC-2026-0370", reason = "transitive via keyring -> zbus 5; no version-compatible replacement" },
+    { id = "RUSTSEC-2026-0371", reason = "transitive via keyring -> zbus 5; no version-compatible replacement" },
+    { id = "RUSTSEC-2026-0372", reason = "transitive via keyring -> zbus 5; no version-compatible replacement" },
+    # Kubernetes client still depends on serde_yaml/unsafe-libyaml.
+    { id = "RUSTSEC-2024-0449", reason = "transitive via kube-client; upstream has no safe replacement release" },
 ]
 
 [licenses]

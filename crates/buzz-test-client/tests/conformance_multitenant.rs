@@ -219,9 +219,9 @@ mod row_zero_host_binding {
     /// row_zero (b) asserts the **`#h` override-attempt**: a channel that exists
     /// *only in B*; an A connection `#h`-tagging it is **rejected** — the host
     /// binding wins over the claim. Sibling-not-replacement: this shares the
-    /// `ingest::check_channel_membership` → `is_member_cached(tenant.community(),
-    /// ch_id)` scope branch with Mari's row, but bites the *override* property,
-    /// not coexistence.
+    /// `ingest::check_channel_write_role` → fresh role/channel lookups under
+    /// `tenant.community()` scope branch with Mari's row, but bites the
+    /// *override* property, not coexistence.
     ///
     /// # Why the channel is `visibility=open` (isolating override from membership)
     ///
@@ -237,7 +237,7 @@ mod row_zero_host_binding {
     /// or shared-membership failure.
     ///
     /// Mutate-bite (would-it-fail-without-the-fix): make
-    /// `ingest::check_channel_membership` resolve the channel against the
+    /// `ingest::check_channel_write_role` resolve the channel against the
     /// *claimed* `#h` community instead of `tenant.community()` (honor the
     /// override) → the A-connection post of B's open channel is accepted and
     /// this row's "A must reject" assertion goes red.
@@ -1474,30 +1474,30 @@ mod channels_membership {
     ///
     /// # What this row asserts: the **coexistence** half of the obligation
     ///
-    /// This row's scope is the **positive arm** of the same `is_member_cached`
-    /// scope branch that [`super::row_zero_host_binding::client_supplied_community_cannot_override_host`]
+    /// This row's scope is the **positive arm** of the same fresh-lookup scope
+    /// branch that [`super::row_zero_host_binding::client_supplied_community_cannot_override_host`]
     /// exercises as the **negative arm**. Sibling-not-replacement, per the
     /// frame Dawn established when reading row_zero (b):
     ///
     ///   * **row_zero (b) (override-attempt)**: channel U exists *only in B*;
     ///     an A connection `#h`-tagging it is rejected (the negative arm of
-    ///     `is_member_cached(A, U)`, which returns `false` because
-    ///     `get_channel(A, U)` is `None`). Proves: client-supplied claim
+    ///     the write gate's `None`-role fallback: `get_channel(A, U)` is
+    ///     `None` → not open → deny). Proves: client-supplied claim
     ///     never overrides host-derived community.
     ///   * **this row (coexistence)**: channel U exists in *both* A and B
     ///     as distinct rows (legal under the `(community_id, id)` PK);
     ///     posts in A land only in A's instance; posts in B land only in
-    ///     B's instance. The positive arm of `is_member_cached`: when U
-    ///     exists in the tenant-derived community, the membership/permission
+    ///     B's instance. The positive arm of the write gate: when U
+    ///     exists in the tenant-derived community, the role/permission
     ///     check finds the *right* row, not the other community's.
     ///
-    /// A bug that resolves `get_channel`/`is_member_cached` against the
+    /// A bug that resolves `get_channel`/the role lookup against the
     /// claimed community instead of the host-derived one would pass row_zero
     /// (b)'s negative-arm test (both sides would still reject A's post
     /// against B-only's U for some reason) but would fail this row's
     /// positive-arm test (A's post might land in B's channel, or vice versa).
     /// So this row catches a class of bugs row_zero (b) structurally cannot,
-    /// even though both share the `is_member_cached` scope branch.
+    /// even though both share the write-gate scope branch.
     ///
     /// # Wire-observable shape
     ///
@@ -1543,7 +1543,7 @@ mod channels_membership {
     /// is the only community fence on the `POST /query` read path. Single-
     /// fence mutation will bite immediately. The `get_channel` fence at
     /// `channel.rs:275` is the *write/permission-check* fence (exercised by
-    /// `is_member_cached` on the post path), not the read fence; together
+    /// `check_channel_write_role` on the post path), not the read fence; together
     /// they're the two-layer scoping of the *whole channel system*, but for
     /// this row's wire-observable read property the load-bearing fence is
     /// `query_events`.

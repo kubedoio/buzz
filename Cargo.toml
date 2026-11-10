@@ -127,7 +127,7 @@ url = "2"
 proptest = "1"
 
 # MCP SDK (used by buzz-dev-mcp and buzz-agent)
-rmcp = { version = "1.1.0", features = ["server", "transport-io", "macros"] }
+rmcp = { version = "3", features = ["server", "transport-io", "macros"] }
 schemars = { version = "1", default-features = false }
 
 # Internal crates
@@ -178,4 +178,6 @@ strip = true
 # (FULL_URI + token-file + Authorization header, refresh-safe, with a loopback
 # allowlist for the auth token). Revert to crates.io once #449 lands upstream.
 [patch.crates-io]
+# SQLx 0.9 caps libsqlite3-sys below 0.38, which Mesh requires.
+sqlx-sqlite = { git = "https://github.com/launchbadge/sqlx", rev = "94aafe3a68884d923b0798a767c8d7f6cfda89d2" }
 aws-creds = { git = "https://github.com/tlongwell-block/rust-s3", rev = "c9fce3620dd434c1f810101d672cf384268dbb0f" }

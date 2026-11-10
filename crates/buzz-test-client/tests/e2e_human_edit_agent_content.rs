@@ -632,7 +632,8 @@ async fn create_private_agent_owned_channel(agent_keys: &Keys) -> String {
 // These tests verify that the membership-gate bypass works on private channels —
 // i.e., a non-member owning human can act on private agent-owned content.
 // Previously all four predicates were unreachable for private channels because
-// check_channel_membership rejected non-members before the per-kind validators ran.
+// the generic gate (check_channel_write_role, formerly check_channel_membership)
+// rejected non-members before the per-kind validators ran.
 
 /// Owner can edit a message in a private agent-owned channel (non-member owner allowed).
 #[tokio::test]

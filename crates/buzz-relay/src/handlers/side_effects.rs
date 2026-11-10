@@ -242,15 +242,59 @@ pub async fn validate_standard_deletion_event(
         if parts.len() < 2 {
             return Err(anyhow::anyhow!("invalid a-tag format"));
         }
+        let target_kind: i32 = parts[0]
+            .parse()
+            .map_err(|_| anyhow::anyhow!("invalid kind in a-tag"))?;
         let target_pubkey_bytes =
             hex::decode(parts[1]).map_err(|_| anyhow::anyhow!("invalid pubkey in a-tag"))?;
-        if target_pubkey_bytes != actor_bytes
-            && !state
+        let d_tag = parts.get(2).copied().unwrap_or("");
+
+        // Resolve the addressable target where a live row exists. kind:5 is
+        // not in requires_h_channel_scope, so a-tag-only deletions never pass
+        // the generic ingest write gate — channel-scoped targets must re-gate
+        // the actor's current role here instead.
+        let target_channel = state
+            .db
+            .get_event_by_coordinate(tenant.community(), target_kind, &target_pubkey_bytes, d_tag)
+            .await?
+            .and_then(|t| t.channel_id);
+
+        if target_pubkey_bytes != actor_bytes {
+            // Owning human of the author agent. The ownership fallback must
+            // not lift the guest read-only restriction: probe fresh roles
+            // first (relay level only when the target is channel-less).
+            super::ingest::check_not_guest_identity(
+                tenant.community(),
+                state,
+                target_channel,
+                &actor_bytes,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if !state
                 .db
                 .is_agent_owner(tenant.community(), &target_pubkey_bytes, &actor_bytes)
                 .await?
-        {
-            return Err(anyhow::anyhow!("must be event author"));
+            {
+                return Err(anyhow::anyhow!("must be event author"));
+            }
+            return Ok(());
+        }
+
+        // Author self-deletion: mirror the kind:9005 author re-gate — a
+        // downgraded guest must not be able to delete their own pre-downgrade
+        // addressable events, and a removed member loses the ability on
+        // private channels immediately.
+        if let Some(ch) = target_channel {
+            super::ingest::check_channel_write_role(
+                tenant.community(),
+                state,
+                ch,
+                &actor_bytes,
+                None,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
         return Ok(());
     }
@@ -264,13 +308,38 @@ pub async fn validate_standard_deletion_event(
 
         let target_author =
             effective_message_author(&target_event.event, &state.relay_keypair.public_key());
-        if target_author != actor_bytes
-            && !state
+        if target_author != actor_bytes {
+            // Owning human of the message's agent author — the ownership
+            // fallback must not lift the guest read-only restriction.
+            super::ingest::check_not_guest_identity(
+                tenant.community(),
+                state,
+                target_event.channel_id,
+                &actor_bytes,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if !state
                 .db
                 .is_agent_owner(tenant.community(), &target_author, &actor_bytes)
                 .await?
-        {
-            return Err(anyhow::anyhow!("must be event author"));
+            {
+                return Err(anyhow::anyhow!("must be event author"));
+            }
+        } else if let Some(ch) = target_event.channel_id {
+            // Author self-deletion of a channel-scoped target: mirror the
+            // kind:9005 author re-gate so the validator itself re-reads the
+            // current role (the generic ingest gate also covers e-tag
+            // channel-scoped deletions; this keeps the rule at the door).
+            super::ingest::check_channel_write_role(
+                tenant.community(),
+                state,
+                ch,
+                &actor_bytes,
+                None,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
     }
 
@@ -364,7 +433,7 @@ pub async fn validate_admin_event(
             //
             // A self-targeted add skips this check so an idempotent re-add
             // still works. That is not a way into a private channel: ingest's
-            // `check_channel_membership` rejects a non-member (and a
+            // `check_channel_write_role` rejects a non-member (and a
             // soft-removed member) before this validator runs, and `add_member`
             // independently requires the self-inviter to hold an active role.
             // Self-promotion is caught by the role-change guard below.
@@ -600,7 +669,17 @@ pub async fn validate_admin_event(
                     _ => {
                         // Allow the owning human of any active owner-role agent in the
                         // channel, even when the human is not a channel member —
-                        // diverges from kind:9001 intentionally.
+                        // diverges from kind:9001 intentionally. The ownership
+                        // fallback must not lift the guest read-only
+                        // restriction: probe the actor's fresh roles first.
+                        super::ingest::check_not_guest_identity(
+                            tenant.community(),
+                            state,
+                            Some(channel_id),
+                            &actor_bytes,
+                        )
+                        .await
+                        .map_err(|e| anyhow::anyhow!("{e}"))?;
                         if actor_owns_any_owner_agent(
                             state,
                             tenant.community(),
@@ -617,15 +696,18 @@ pub async fn validate_admin_event(
                     }
                 }
             } else {
-                // topic/purpose: any member
-                let is_member = state
-                    .is_member_cached(tenant.community(), channel_id, &actor_bytes)
-                    .await?;
-                if is_member {
-                    Ok(())
-                } else {
-                    Err(anyhow::anyhow!("not a member"))
-                }
+                // topic/purpose: any non-guest member. The shared write gate
+                // is the authority — guests are read-only, and non-members
+                // keep the documented open-channel write fallback.
+                super::ingest::check_channel_write_role(
+                    tenant.community(),
+                    state,
+                    channel_id,
+                    &actor_bytes,
+                    Some(&channel),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))
             }
         }
         9005 => {
@@ -674,24 +756,31 @@ pub async fn validate_admin_event(
             let author =
                 effective_message_author(&target_event.event, &state.relay_keypair.public_key());
             if author_delete_can_use_self_delete_path(&author, &actor_bytes, event) {
-                // Author deleting their own message: re-gate on membership/open visibility so that
-                // a removed private-channel member cannot mutate old messages after access is revoked.
-                let is_member = state
-                    .is_member_cached(tenant.community(), channel_id, &actor_bytes)
-                    .await?;
-                if is_member {
-                    return Ok(());
+                // Author deleting their own message: re-gate through the
+                // shared write-role check so a guest member cannot self-delete
+                // and a just-removed private-channel member loses the ability
+                // immediately (no cache window). A denial here falls through
+                // to the owner/admin / owner-of-agent check below.
+                match super::ingest::check_channel_write_role(
+                    tenant.community(),
+                    state,
+                    channel_id,
+                    &actor_bytes,
+                    Some(&channel),
+                )
+                .await
+                {
+                    Ok(()) => return Ok(()),
+                    // Fail closed on a DB error, as the old membership probe did.
+                    Err(msg) if msg.starts_with("error:") => {
+                        return Err(anyhow::anyhow!("{msg}"));
+                    }
+                    // Role-gate denial (guest / removed on private) — the
+                    // owner/admin / owner-of-agent path below may still apply.
+                    Err(_) => {}
                 }
-                let is_open = state
-                    .db
-                    .get_channel(tenant.community(), channel_id)
-                    .await
-                    .map(|ch| ch.visibility == "open")
-                    .unwrap_or(false);
-                if is_open {
-                    return Ok(());
-                }
-                // Not a member and channel is private — fall through to owner/admin/owner-of-agent check.
+                // Not authorized by membership/open-visibility — fall through
+                // to the owner/admin/owner-of-agent check.
             }
 
             // Not the author, or author who is no longer a member of a private channel —
@@ -701,7 +790,17 @@ pub async fn validate_admin_event(
                 Ok(())
             } else {
                 // Allow the owning human of the agent that authored the target message,
-                // even when the human is not a channel member.
+                // even when the human is not a channel member. The ownership
+                // fallback must not lift the guest read-only restriction:
+                // probe the actor's fresh roles first.
+                super::ingest::check_not_guest_identity(
+                    tenant.community(),
+                    state,
+                    Some(channel_id),
+                    &actor_bytes,
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
                 if state
                     .db
                     .is_agent_owner(tenant.community(), &author, &actor_bytes)
@@ -724,7 +823,17 @@ pub async fn validate_admin_event(
                 _ => {
                     // Allow the owning human of any active owner-role agent in the
                     // channel, even when the human is not a channel member —
-                    // diverges from kind:9001 intentionally.
+                    // diverges from kind:9001 intentionally. The ownership
+                    // fallback must not lift the guest read-only restriction:
+                    // probe the actor's fresh roles first.
+                    super::ingest::check_not_guest_identity(
+                        tenant.community(),
+                        state,
+                        Some(channel_id),
+                        &actor_bytes,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
                     if actor_owns_any_owner_agent(state, tenant.community(), &members, &actor_bytes)
                         .await?
                     {
@@ -1951,6 +2060,10 @@ async fn handle_join_request(
 
     // Skip if already an active member — prevents duplicate join notifications.
     // Fail closed on DB errors rather than falling through to add_member.
+    // A stale cached `false` here is benign: add_member is idempotent and its
+    // active-role-change guard rejects re-adding an existing member under a
+    // different role without an elevated granter, so no privilege change can
+    // ride on a cache miss.
     if state
         .is_member_cached(tenant.community(), channel_id, &actor_bytes)
         .await?

@@ -1868,6 +1868,18 @@ impl Db {
         .await
     }
 
+    /// Fetch the newest live row for an addressable coordinate. Used to
+    /// resolve kind:5 `a`-tag deletion targets to their channel.
+    pub async fn get_event_by_coordinate(
+        &self,
+        community_id: CommunityId,
+        kind: i32,
+        pubkey: &[u8],
+        d_tag: &str,
+    ) -> Result<Option<buzz_core::StoredEvent>> {
+        event::get_event_by_coordinate(&self.pool, community_id, kind, pubkey, d_tag).await
+    }
+
     /// Atomically soft-delete an event and decrement thread reply counters.
     pub async fn soft_delete_event_and_update_thread(
         &self,
@@ -4091,13 +4103,16 @@ impl Db {
         relay_members::add_relay_member(&self.pool, community, pubkey, role, added_by).await
     }
 
-    /// Whether this community rejects legacy membership writers.
+    /// Whether this community rejects legacy membership writers. A community
+    /// without a row cannot have opted in — the column default is `false` —
+    /// so a missing row answers `false`; only a real database error fails.
     pub async fn membership_v1alpha2(&self, community: CommunityId) -> Result<bool> {
         Ok(
             sqlx::query_scalar("SELECT membership_v1alpha2 FROM communities WHERE id = $1")
                 .bind(community.as_uuid())
-                .fetch_one(&self.pool)
-                .await?,
+                .fetch_optional(&self.pool)
+                .await?
+                .unwrap_or(false),
         )
     }
 

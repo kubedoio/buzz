@@ -240,14 +240,29 @@ impl ActionSink for RelayActionSink {
             })?;
             let author_pubkey_bytes = author_pubkey.to_bytes().to_vec();
             let author_pubkey_hex = author_pubkey.to_hex();
-            let is_member = state
-                .is_member_cached(tenant.community(), channel_uuid, &author_pubkey_bytes)
-                .await
-                .map_err(|e| ActionSinkError::Database(e.to_string()))?;
-            if !is_member && channel.visibility != "open" {
-                return Err(ActionSinkError::InvalidInput(
-                    "workflow owner does not have access to destination channel".into(),
-                ));
+            // The workflow executes with its owner's standing authority, so the
+            // owner must hold a write-capable role in the destination channel
+            // at post time. The shared write gate re-reads the role fresh: a
+            // guest owner (read-only) or an owner removed since the run
+            // started is denied, and the documented open-channel non-member
+            // fallback is preserved.
+            match crate::handlers::ingest::check_channel_write_role(
+                tenant.community(),
+                &state,
+                channel_uuid,
+                &author_pubkey_bytes,
+                Some(&channel),
+            )
+            .await
+            {
+                Ok(()) => {}
+                // Fail closed on a genuine DB error, as the old probe did.
+                Err(msg) if msg.starts_with("error:") => {
+                    return Err(ActionSinkError::Database(msg));
+                }
+                Err(msg) => {
+                    return Err(ActionSinkError::InvalidInput(msg));
+                }
             }
 
             // 3. Build kind:9 Nostr event

@@ -783,6 +783,18 @@ jobs:
         env:
           RELAY_URL: ws://localhost:3000
           GIT_CREDENTIAL_NOSTR_BIN: ${{ github.workspace }}/target/ci/git-credential-nostr
+      - name: Guest write-denial regression e2e
+        # Security regression coverage for the guest-role read-only invariant:
+        # the generic channel write gate, the kind:9002 topic/purpose branch,
+        # and the kind:40003/9005 self-edit/self-delete author re-gates must
+        # all deny guest-role members, with no membership-cache window after
+        # a downgrade or removal. #[ignore]d in the default suite, selected
+        # explicitly here under the same relay harness as the e2e tests.
+        run: |
+          cargo test -p buzz-test-client --test regression_guest_write_denial -- --ignored --nocapture
+        env:
+          RELAY_URL: ws://localhost:3000
+          DATABASE_URL: postgres://buzz:${{ env.BUZZ_TEST_POSTGRES_PASSWORD }}@localhost:5432/buzz
       - name: Media read-auth e2e
         # Reads require kind:24242 `t=get` auth, so these binaries are the only
         # coverage that a real relay rejects bare reads and honours host- and

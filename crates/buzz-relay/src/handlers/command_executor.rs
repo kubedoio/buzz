@@ -8,6 +8,9 @@
 //! 2. Timestamp freshness (±15 min)
 //! 3. Pubkey/auth identity match
 //! 4. Per-kind scope authorization
+//! 5. Channel-scoped command events (any `h` tag) have passed the shared
+//!    write-authority gate `ingest::check_channel_write_role` — guests are
+//!    read-only and never reach this module for channel-scoped commands.
 
 use std::sync::Arc;
 
@@ -669,16 +672,19 @@ async fn handle_workflow_def(
     let workflow_id = Uuid::parse_str(&workflow_id_str)
         .map_err(|_| IngestError::Rejected("invalid: bad workflow_id format".into()))?;
 
-    // 2. Validate caller has channel access (minimum: is a member)
-    let is_member = state
-        .is_member_cached(tenant.community(), channel_id, &self_bytes)
-        .await
-        .map_err(|e| IngestError::Internal(format!("error: membership check: {e}")))?;
-    if !is_member {
-        return Err(IngestError::Rejected(
-            "forbidden: not a member of this channel".into(),
-        ));
-    }
+    // 2. Validate the caller holds a write-capable role in the channel through
+    // the shared write-authority gate (fresh role read). A guest is read-only
+    // and cannot mint a durable workflow that would later post with the
+    // owner's standing authority.
+    super::ingest::check_channel_write_role(
+        tenant.community(),
+        state,
+        channel_id,
+        &self_bytes,
+        None,
+    )
+    .await
+    .map_err(IngestError::Rejected)?;
 
     // 3. Parse YAML from event.content
     let (def, definition_json_str) = buzz_workflow::WorkflowEngine::parse_yaml(&event.content)

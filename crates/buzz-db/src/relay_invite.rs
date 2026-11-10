@@ -411,6 +411,11 @@ mod tests {
             .execute(&mut *tx)
             .await
             .expect("delete test members");
+        sqlx::query("DELETE FROM relay_membership_state WHERE community_id = $1")
+            .bind(community.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .expect("delete test membership state");
         sqlx::query("DELETE FROM communities WHERE id = $1")
             .bind(community.as_uuid())
             .execute(&mut *tx)
