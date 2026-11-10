@@ -182,7 +182,7 @@ COPY --from=stripped-binaries /build/target/release/buzz-pair-relay /usr/local/b
 # while the supported Elembra profile ships only the relay binary on a pinned
 # distroless base. BUZZ_GIT_ENABLED is also enforced by the application so
 # routes and the startup Git probe are absent, not merely unreachable.
-FROM gcr.io/distroless/cc-debian13:nonroot@sha256:54df941ed0d06a1bd95ef5e0ce391fd8d9f94b64782dc9a60062727849ee3f97 AS runtime-elembra
+FROM gcr.io/distroless/cc-debian13:nonroot@sha256:cc66d222f0a7ec996b78a99fe76a969bc80b539a5016ad866c14d1949bc6d0ab AS runtime-elembra
 LABEL org.opencontainers.image.title="Buzz Elembra Chat Relay" \
       org.opencontainers.image.description="Chat-focused Buzz relay runtime for Elembra" \
       org.opencontainers.image.source="https://github.com/kubedoio/buzz" \
