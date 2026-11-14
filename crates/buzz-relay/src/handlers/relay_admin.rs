@@ -345,6 +345,70 @@ async fn execute_relay_admin_command(
         let expected_revision = single("elembra-expected-revision")?
             .parse::<i64>()
             .map_err(|_| "invalid revision")?;
+        let release_of: Vec<_> = event
+            .tags
+            .iter()
+            .filter(|tag| tag.as_slice()[0] == "elembra-release-of")
+            .collect();
+        if !release_of.is_empty() {
+            if kind != RELAY_ADMIN_ADD_MEMBER
+                || release_of.len() != 1
+                || release_of[0].as_slice().len() != 2
+                || event
+                    .tags
+                    .iter()
+                    .any(|tag| tag.as_slice()[0] == "elembra-stage")
+            {
+                return Err("invalid staged membership release".into());
+            }
+            if !state
+                .config
+                .relay_trusted_service_pubkeys
+                .contains(&sender_hex)
+            {
+                return Err("untrusted membership release service".into());
+            }
+            let staged_operation_id = release_of[0].as_slice()[1]
+                .parse::<uuid::Uuid>()
+                .map_err(|_| "invalid staged operation ID")?;
+            let outcome = state
+                .db
+                .release_relay_membership(
+                    tenant.community(),
+                    &target_hex,
+                    &sender_hex,
+                    operation_id,
+                    staged_operation_id,
+                    expected_revision,
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            if outcome != "ok" {
+                return Err(format!("membership release: {outcome}"));
+            }
+            return Ok(());
+        }
+        let staged_tags: Vec<_> = event
+            .tags
+            .iter()
+            .filter(|tag| tag.as_slice()[0] == "elembra-stage")
+            .collect();
+        let staged = match staged_tags.as_slice() {
+            [] => false,
+            [tag] if tag.as_slice().len() == 2 && tag.as_slice()[1] == "true" => true,
+            _ => return Err("invalid staged membership tag".into()),
+        };
+        if staged && kind != RELAY_ADMIN_ADD_MEMBER {
+            return Err("only additions may be staged".into());
+        }
+        if staged
+            && !state
+                .config
+                .relay_trusted_service_pubkeys
+                .contains(&sender_hex)
+        {
+            return Err("untrusted staged membership service".into());
+        }
         let role = if kind == RELAY_ADMIN_ADD_MEMBER {
             extract_tag_value(event, "role").unwrap_or_else(|| "member".into())
         } else {
@@ -352,7 +416,7 @@ async fn execute_relay_admin_command(
         };
         let (outcome, _, changed) = state
             .db
-            .conditional_membership(
+            .conditional_membership_with_gate(
                 tenant.community(),
                 &buzz_db::relay_members::ConditionalMembership {
                     pubkey: &target_hex,
@@ -362,6 +426,7 @@ async fn execute_relay_admin_command(
                     role: &role,
                     expected_revision,
                 },
+                staged,
             )
             .await
             .map_err(|e| e.to_string())?;

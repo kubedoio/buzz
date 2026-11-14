@@ -57,6 +57,51 @@ async fn audio_connect(channel: Uuid, keys: &Keys) -> AudioSocket {
     }
 }
 
+async fn audio_rejected(channel: Uuid, keys: &Keys) -> bool {
+    use tokio_tungstenite::tungstenite::Message;
+    let Ok((mut socket, _)) =
+        tokio_tungstenite::connect_async(format!("ws://localhost:55443/huddle/{channel}/audio"))
+            .await
+    else {
+        return true;
+    };
+    let Ok(Some(Ok(challenge))) = tokio::time::timeout(Duration::from_secs(3), socket.next()).await
+    else {
+        return true;
+    };
+    let Ok(challenge) = serde_json::from_str::<Value>(challenge.to_text().unwrap_or_default())
+    else {
+        return true;
+    };
+    let Ok(event) = EventBuilder::new(Kind::Custom(22242), "")
+        .tags([
+            Tag::parse(["relay", "ws://localhost:55443"]).unwrap(),
+            Tag::parse([
+                "challenge",
+                challenge["challenge"].as_str().unwrap_or_default(),
+            ])
+            .unwrap(),
+        ])
+        .sign_with_keys(keys)
+    else {
+        return false;
+    };
+    if socket
+        .send(Message::Text(
+            json!({"type":"auth","event":event}).to_string().into(),
+        ))
+        .await
+        .is_err()
+    {
+        return true;
+    }
+    matches!(
+        tokio::time::timeout(Duration::from_secs(3), socket.next()).await,
+        Ok(Some(Ok(Message::Text(text)))) if serde_json::from_str::<Value>(&text)
+            .is_ok_and(|message| message["type"] == "error")
+    )
+}
+
 async fn assert_audio_closed(socket: &mut AudioSocket) {
     use tokio_tungstenite::tungstenite::Message;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -201,13 +246,25 @@ async fn mutate(
     op: Uuid,
     revision: u64,
 ) -> bool {
-    let tags = [
+    mutate_with_extra_tags(http, actor, p, kind, op, revision, Vec::new()).await
+}
+
+async fn mutate_with_extra_tags(
+    http: &reqwest::Client,
+    actor: &Keys,
+    p: &str,
+    kind: u16,
+    op: Uuid,
+    revision: u64,
+    extra_tags: Vec<Vec<String>>,
+) -> bool {
+    let mut tags = vec![
         vec!["p".into(), p.into()],
         vec!["elembra-op".into(), op.to_string()],
         vec!["elembra-expected-revision".into(), revision.to_string()],
-    ]
-    .into_iter()
-    .map(|t| Tag::parse(t).unwrap());
+    ];
+    tags.extend(extra_tags);
+    let tags = tags.into_iter().map(|t| Tag::parse(t).unwrap());
     let event = EventBuilder::new(Kind::Custom(kind), "")
         .tags(tags)
         .sign_with_keys(actor)
@@ -360,6 +417,211 @@ async fn live_membership_contract() {
     .execute(&pool)
     .await
     .unwrap();
+    // v1alpha2 must enforce exact-key admission even on this open relay.
+    let mut publisher = BuzzTestClient::connect("ws://localhost:55443", &service)
+        .await
+        .unwrap();
+    let visible_event = EventBuilder::new(Kind::Custom(20002), "visible to members")
+        .sign_with_keys(&service)
+        .unwrap();
+    assert!(publisher.send_event(visible_event).await.unwrap().accepted);
+    drop(publisher);
+    let staged = Keys::generate();
+    let staged_pubkey = staged.public_key().to_hex();
+    let staged_op = Uuid::new_v4();
+    assert!(
+        !mutate_with_extra_tags(
+            &http,
+            &Keys::generate(),
+            &staged_pubkey,
+            9030,
+            staged_op,
+            0,
+            vec![vec!["elembra-stage".into(), "true".into()]],
+        )
+        .await
+    );
+    assert!(
+        mutate_with_extra_tags(
+            &http,
+            &service,
+            &staged_pubkey,
+            9030,
+            staged_op,
+            0,
+            vec![vec!["elembra-stage".into(), "true".into()]],
+        )
+        .await
+    );
+    let staged_state = read(&http, &service, &relay, c, &staged_pubkey).await;
+    assert_eq!(staged_state["membership"], "active");
+    assert_eq!(staged_state["membership_revision"], 1);
+    assert_eq!(staged_state["send_enabled"], false);
+    assert_eq!(staged_state["staged_operation_id"], staged_op.to_string());
+    assert!(BuzzTestClient::connect("ws://localhost:55443", &staged)
+        .await
+        .is_err());
+    let delegation =
+        buzz_sdk::nip_oa::compute_auth_tag(&service, &staged.public_key(), "kind=0").unwrap();
+    let delegation = buzz_sdk::nip_oa::parse_auth_tag(&delegation).unwrap();
+    let mut delegated = BuzzTestClient::connect_unauthenticated("ws://localhost:55443")
+        .await
+        .unwrap();
+    assert!(delegated
+        .authenticate_with_nip_oa(&staged, &delegation)
+        .await
+        .is_err());
+    let event = EventBuilder::new(Kind::Metadata, "{}")
+        .sign_with_keys(&staged)
+        .unwrap();
+    let response = post(
+        &http,
+        &staged,
+        "localhost:55443",
+        "/events",
+        &serde_json::to_value(event.clone()).unwrap(),
+    )
+    .await;
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    let body = serde_json::to_vec(&serde_json::to_value(event).unwrap()).unwrap();
+    let response = http
+        .post("http://localhost:55443/events")
+        .header("Host", "localhost:55443")
+        .header(
+            "Authorization",
+            auth(&staged, "localhost:55443", "/events", &body),
+        )
+        .header(
+            "x-auth-tag",
+            buzz_sdk::nip_oa::compute_auth_tag(&service, &staged.public_key(), "kind=0").unwrap(),
+        )
+        .header("Content-Type", "application/json")
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FORBIDDEN);
+    assert!(audio_rejected(audio_channel, &staged).await);
+    let mut unauthenticated = BuzzTestClient::connect_unauthenticated("ws://localhost:55443")
+        .await
+        .unwrap();
+    let event = EventBuilder::new(Kind::Metadata, "{}")
+        .sign_with_keys(&staged)
+        .unwrap();
+    assert!(!unauthenticated
+        .send_event(event)
+        .await
+        .is_ok_and(|response| response.accepted));
+    unauthenticated
+        .subscribe(
+            "staged-open-relay",
+            vec![nostr::Filter::new().kind(Kind::Custom(20002))],
+        )
+        .await
+        .unwrap();
+    assert!(!matches!(
+        unauthenticated.recv_event(Duration::from_millis(300)).await,
+        Ok(buzz_test_client::RelayMessage::Event { .. })
+    ));
+
+    let stale_release = Uuid::new_v4();
+    assert!(
+        !mutate_with_extra_tags(
+            &http,
+            &service,
+            &staged_pubkey,
+            9030,
+            stale_release,
+            0,
+            vec![vec!["elembra-release-of".into(), staged_op.to_string()]],
+        )
+        .await
+    );
+    let release_op = Uuid::new_v4();
+    assert!(
+        !mutate_with_extra_tags(
+            &http,
+            &Keys::generate(),
+            &staged_pubkey,
+            9030,
+            release_op,
+            1,
+            vec![vec!["elembra-release-of".into(), staged_op.to_string()]],
+        )
+        .await
+    );
+    let release_tags = vec![vec!["elembra-release-of".into(), staged_op.to_string()]];
+    assert!(
+        mutate_with_extra_tags(
+            &http,
+            &service,
+            &staged_pubkey,
+            9030,
+            release_op,
+            1,
+            release_tags.clone(),
+        )
+        .await
+    );
+    assert!(
+        mutate_with_extra_tags(
+            &http,
+            &service,
+            &staged_pubkey,
+            9030,
+            release_op,
+            1,
+            release_tags,
+        )
+        .await
+    );
+    let released_state = read(&http, &service, &relay, c, &staged_pubkey).await;
+    assert_eq!(released_state["membership_revision"], 2);
+    assert_eq!(released_state["send_enabled"], true);
+    assert_eq!(released_state["staged_operation_id"], Value::Null);
+
+    let revoked_staged = Keys::generate();
+    let revoked_op = Uuid::new_v4();
+    assert!(
+        mutate_with_extra_tags(
+            &http,
+            &service,
+            &revoked_staged.public_key().to_hex(),
+            9030,
+            revoked_op,
+            0,
+            vec![vec!["elembra-stage".into(), "true".into()]],
+        )
+        .await
+    );
+    let revoked_staged_pubkey = revoked_staged.public_key().to_hex();
+    assert!(
+        mutate(
+            &http,
+            &service,
+            &revoked_staged_pubkey,
+            9031,
+            Uuid::new_v4(),
+            1
+        )
+        .await
+    );
+    assert!(
+        !mutate_with_extra_tags(
+            &http,
+            &service,
+            &revoked_staged_pubkey,
+            9030,
+            Uuid::new_v4(),
+            2,
+            vec![vec!["elembra-release-of".into(), revoked_op.to_string()]],
+        )
+        .await
+    );
+    let revoked_state = read(&http, &service, &relay, c, &revoked_staged_pubkey).await;
+    assert_eq!(revoked_state["membership"], "revoked");
+    assert_eq!(revoked_state["send_enabled"], false);
+
     let mut audio_sender = audio_connect(audio_channel, &member).await;
     let mut audio_reader = audio_connect(audio_channel, &member).await;
     let mut audio_publisher = audio_connect(audio_channel, &service).await;
